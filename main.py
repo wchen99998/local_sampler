@@ -88,7 +88,7 @@ def run(cfg):
             ).scatter_(0, torch.randperm(num_timesteps)[:timesteps_for_loss], True)
 
             num_loss = 0
-            x_t = base.sample((batch_size * 2,)).to(device) # half for training; half for importance weight
+            x_t = base.sample((batch_size * 4,)).to(device) # half for training; half for importance weight
             for i in range(num_timesteps):
                 t = timesteps[i].expand(x_t.shape[0], 1)    # (B*2, 1)
                 with torch.no_grad():

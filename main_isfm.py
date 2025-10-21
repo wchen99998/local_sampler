@@ -87,7 +87,7 @@ def run(cfg):
             optimizer.step()
 
             total_epoch_loss += loss.item()
-            wandb.log({f"train/loss": loss.item()})
+            # wandb.log({f"train/loss": loss.item()})
             # print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{batches_per_epoch}], Loss: {loss.item():.4f}")
 
         v_theta.eval()
