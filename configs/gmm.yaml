@@ -20,11 +20,15 @@ optimiser:
   learning_rate: 0.001
 
 training:
-  num_epochs: 100
-  batches_per_epoch: 50
-  batch_size: 64
-  timesteps_for_loss: 10
-  num_timesteps: 100
+  num_epochs: 5000
+  batches_per_epoch: 100
+  batch_size: 128
+  timesteps_for_loss: 32
+  num_timesteps: 200
 
 sampling:
-  num_timesteps: {training.num_timesteps}
+  num_timesteps: ${training.num_timesteps}
+
+wandb:
+  project: Locally-Tilted-Sampler
+  name: GMM40

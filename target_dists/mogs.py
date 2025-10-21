@@ -3,10 +3,10 @@ import itertools
 import numpy as np
 from matplotlib import pyplot as plt
 
-class GMM(torch.nn.Module):
+class GMM40(torch.nn.Module):
     def __init__(self, dim, n_mixes, loc_scaling, log_var_scaling=1., seed=0,
                  n_test_set_samples=1000, device="cpu"):
-        super(GMM, self).__init__()
+        super(GMM40, self).__init__()
 
         # fix mean and variance for reproducibility
         torch.manual_seed(0)
@@ -54,6 +54,55 @@ class GMM(torch.nn.Module):
         mask[log_prob < -1e4] = - torch.tensor(float("inf"))
         log_prob = log_prob + mask
         return log_prob
+
+    def sample(self, shape=(1,)):
+        return self.distribution.sample(shape)
+
+class GMM9(torch.nn.Module):
+    def __init__(self, dim=2, scale=4., std=1., seed=0,
+                 n_test_set_samples=1000, device="cpu"):
+        super(GMM9, self).__init__()
+
+        self.n_mixes = 9
+        self.n_test_set_samples = n_test_set_samples
+        self.dimensionality = 2
+
+        mean = torch.tensor(
+            [[-scale, -scale], [-scale, scale], [scale, scale], [scale, -scale], [-scale, 0.0], [scale, 0.0], [0.0, -scale], [0.0, scale], [0.0, 0.0]])
+        
+        self.std = std
+
+        self.register_buffer("cat_probs", torch.ones(self.n_mixes) / 8)
+        self.register_buffer("locs", mean)
+        self.device = device
+        self.to(self.device)
+
+    def to(self, device):
+        if device == "cuda":
+            if torch.cuda.is_available():
+                self.cuda()
+        else:
+            self.cpu()
+
+    @property
+    def distribution(self):
+        mix = torch.distributions.Categorical(self.cat_probs.to(self.device))
+        com = torch.distributions.Independent(
+                torch.distributions.Normal(
+                    self.locs.to(self.device),
+                    (torch.ones(self.n_mixes, self.dimensionality) * self.std).to(self.device),
+                ),
+                1
+        )
+        return torch.distributions.MixtureSameFamily(mixture_distribution=mix,
+                                                     component_distribution=com)
+
+    @property
+    def test_set(self) -> torch.Tensor:
+        return self.sample((self.n_test_set_samples, ))
+
+    def log_prob(self, x: torch.Tensor):
+        return self.distribution.log_prob(x)
 
     def sample(self, shape=(1,)):
         return self.distribution.sample(shape)
@@ -133,6 +182,7 @@ def plot_contours(log_prob_func,
                   samples = None,
                   ax = None,
                   bounds = (-5.0, 5.0),
+                  xy_ticks=(-40, 40),
                   grid_width_n_points = 20,
                   n_contour_levels = None,
                   log_prob_min = -1000.0,
@@ -164,8 +214,8 @@ def plot_contours(log_prob_func,
         ax.scatter(samples[:, plot_marginal_dims[0]], samples[:, plot_marginal_dims[1]], s=s, alpha=alpha)
         ### x,y ticks
         if xy_tick:
-            ax.set_xticks([-40,0,40])
-            ax.set_yticks([-40,0,40])
+            ax.set_xticks([xy_ticks[0],0,xy_ticks[1]])
+            ax.set_yticks([xy_ticks[0],0,xy_ticks[1]])
         ### size of ticks
         ax.tick_params(axis='both', which='major', labelsize=15)
     if title:
@@ -177,10 +227,27 @@ def plot_contours(log_prob_func,
 
     return fig
 
+def plot_heat(log_prob_function, samples, size=4.5):
+    w = 100
+    x = np.linspace(-size, size, w)
+    y = np.linspace(-size, size, w)
+    xx, yy = np.meshgrid(x, y)
+    xx = np.reshape(xx, [-1, 1])
+    yy = np.reshape(yy, [-1, 1])
+    data = torch.from_numpy(np.concatenate((xx, yy), axis=-1)).to("cuda").float()
+    heat_score = log_prob_function(data).exp().cpu().detach().numpy()
+    fig = plt.figure(figsize=(4, 4))
+    plt.imshow(heat_score.reshape(w, w), extent=(-size, size, -size, size), origin='lower')
+    plt.scatter(samples[:, 0], samples[:, 1], c='r', s=1)
+    return fig
 
-def plot_MoG40(log_prob_function,samples, save_path=None, save_name=None,title=None):
-    fig = plot_contours(log_prob_function, samples=samples.detach().cpu().numpy(), bounds=(-56,56), n_contour_levels=50, grid_width_n_points=200, device="cuda",title=title,plt_show=False)
-    # plt.savefig(f"""tmp.png""")
-    plt.close(fig)
 
+def plot_MoG(log_prob_function, samples, name='GMM40', save_path=None, save_name=None,title=None):
+    if name == 'GMM40':
+        fig = plot_contours(log_prob_function, samples=samples.detach().cpu().numpy(), bounds=(-56,56), n_contour_levels=50, grid_width_n_points=200, device="cuda",title=title,plt_show=False)
+    elif name == "GMM9":
+        fig = plot_heat(log_prob_function, samples=samples.detach().cpu().numpy())
+    else:
+        raise NotImplementedError
+    
     return fig
