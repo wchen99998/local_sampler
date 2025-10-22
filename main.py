@@ -43,7 +43,7 @@ def run(cfg):
         hidden_dim=cfg.model.hidden_dim,
         depth=cfg.model.depth,
     ).to(device)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         v_theta.parameters(), lr=cfg.optimiser.learning_rate
     )
 
@@ -73,7 +73,7 @@ def run(cfg):
     eps = 1e-5
     timesteps = torch.linspace(eps, 1.0, num_timesteps).to(device)
     dt = (1 - eps) / num_timesteps
-    delta_t = 0.01
+    delta_t = dt
     for epoch in range(num_epochs):
 
         total_epoch_loss = 0.0
@@ -96,20 +96,19 @@ def run(cfg):
 
                 if timesteps[i] <= 1 - delta_t and is_selected_timestep[i]:
                     # Compute loss only for selected timesteps
-                    t_ = torch.rand((batch_size, 1), device=device) # (B, 1)
+                    u = torch.rand((batch_size, 1), device=device) # (B, 1)
                     z_ts = x_t[:batch_size, :]  # training samples (B, D)
                     z_te = x_t[batch_size:, :]  # importance weight samples (B, D)
 
                     weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
                     indices = torch.multinomial(weights, num_samples=batch_size, replacement=True)
                     z_te = z_te[indices, :]  # (B, D)
-                    weights = weights[indices]  # (B,)
+                    # weights = weights[indices]  # (B,)
 
-                    z_t = (1 - t_) * z_ts + t_ * z_te  # (B, D)
+                    z_t = (1 - u) * z_ts + u * z_te  # (B, D)
 
-                    t_ = t_ * delta_t + t[:t_.size(0), :]  # (B, 1)
-                    loss_before = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean(dim=-1)
-                    loss += (loss_before * weights).mean()  # scalar
+                    t_ = u * delta_t + t[:u.size(0), :]  # (B, 1)
+                    loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean()
                     num_loss += 1
 
                 x_t = x_t + v_t * dt
