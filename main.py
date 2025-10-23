@@ -88,7 +88,8 @@ def run(cfg):
             ).scatter_(0, torch.randperm(num_timesteps)[:timesteps_for_loss], True)
 
             num_loss = 0
-            x_t = base.sample((batch_size * 4,)).to(device) # half for training; half for importance weight
+            x_t = base.sample((batch_size * 2,)).to(device) # half for training; half for importance weight
+            loss = 0
             for i in range(num_timesteps):
                 t = timesteps[i].expand(x_t.shape[0], 1)    # (B*2, 1)
                 with torch.no_grad():
@@ -100,15 +101,20 @@ def run(cfg):
                     z_ts = x_t[:batch_size, :]  # training samples (B, D)
                     z_te = x_t[batch_size:, :]  # importance weight samples (B, D)
 
-                    weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
-                    indices = torch.multinomial(weights, num_samples=batch_size, replacement=True)
-                    z_te = z_te[indices, :]  # (B, D)
-                    # weights = weights[indices]  # (B,)
+                    # weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
+                    # indices = torch.multinomial(weights, num_samples=batch_size, replacement=True)
+                    # z_te = z_te[indices, :]  # (B, D)
+                    # z_t = (1 - u) * z_ts + u * z_te  # (B, D)
+                    # t_ = u * delta_t + t[:u.size(0), :]  # (B, 1)
+                    # loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean()
 
                     z_t = (1 - u) * z_ts + u * z_te  # (B, D)
-
                     t_ = u * delta_t + t[:u.size(0), :]  # (B, 1)
-                    loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean()
+                    weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
+                    tmp_loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean(dim=-1)
+                    tmp_loss = (tmp_loss * weights).mean()
+
+                    loss += tmp_loss
                     num_loss += 1
 
                 x_t = x_t + v_t * dt
