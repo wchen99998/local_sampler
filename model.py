@@ -1,23 +1,26 @@
-import torch
-import torch.nn as nn
+import jax
+import jax.numpy as jnp
+import flax.nnx as nnx
 
-class TimeVelocityField(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, depth=3):
-        super(TimeVelocityField, self).__init__()
+class TimeVelocityField(nnx.Module):
+    """Simple MLP that models the time-dependent velocity field."""
 
-        self.layers = nn.ModuleList()
+    def __init__(self, input_dim: int, hidden_dim: int, depth: int = 3, *, rngs: nnx.Rngs):
+        if depth < 1:
+            raise ValueError("depth must be >= 1")
 
-        self.layers.append(nn.Linear(input_dim+1, hidden_dim))
-        for _ in range(depth - 1):
-            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-        
-        self.output_layer = nn.Linear(hidden_dim, input_dim)
+        self.layers = nnx.List()
+        in_features = input_dim + 1  # concat x and t
+        for _ in range(depth):
+            self.layers.append(nnx.Linear(in_features, hidden_dim, rngs=rngs))
+            in_features = hidden_dim
 
-    def forward(self, x, t):
-        h = torch.cat([x, t], dim=-1)
+        self.output_layer = nnx.Linear(hidden_dim, input_dim, rngs=rngs)
 
+    def __call__(self, x: jax.Array, t: jax.Array) -> jax.Array:
+        """Forward pass that expects x and t with matching leading dims."""
+        h = jnp.concatenate([x, t], axis=-1)
         for layer in self.layers:
-            h = torch.sigmoid(layer(h))
-
+            h = jax.nn.sigmoid(layer(h))
         return self.output_layer(h)

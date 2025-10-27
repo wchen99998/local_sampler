@@ -1,68 +1,63 @@
 import os
-import hydra
-import wandb
 import tempfile
-from omegaconf import DictConfig
+
+import hydra
+import jax
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import optax
+import wandb
+import flax.nnx as nnx
+from jax import lax, random as jrandom
+from omegaconf import DictConfig
 
-import torch
-
-from utils import seed_everything
-from target_dists.mogs import GMM9, GMM40, MultivariateGaussian, plot_MoG
 from model import TimeVelocityField
+from target_dists.mogs import GMM40, GMM9, MultivariateGaussian, plot_MoG
+from utils import seed_everything
+
 
 def run(cfg):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    key = seed_everything(cfg.seed)
 
     if cfg.wandb.name == "GMM40":
         target = GMM40(
-            dim=cfg.target.input_dim, 
-            n_mixes=cfg.target.gmm_n_mixes, 
-            loc_scaling=40, 
+            dim=cfg.target.input_dim,
+            n_mixes=cfg.target.gmm_n_mixes,
+            loc_scaling=40,
             log_var_scaling=1,
             seed=cfg.seed,
-            device=device,
-        )  
+        )
     elif cfg.wandb.name == "GMM9":
         target = GMM9(
-            dim=cfg.target.input_dim, 
-            scale=3, 
-            std=.35,
-            device=device,
+            dim=cfg.target.input_dim,
+            scale=3,
+            std=0.35,
+            seed=cfg.seed,
         )
     else:
         raise NotImplementedError
-    
+
     base = MultivariateGaussian(
         dim=cfg.target.input_dim,
         sigma=cfg.base.initial_sigma,
-        device=device,
     )
+
+    key, model_key = jrandom.split(key)
+    rngs = nnx.Rngs(model_key)
     v_theta = TimeVelocityField(
         input_dim=cfg.target.input_dim,
         hidden_dim=cfg.model.hidden_dim,
         depth=cfg.model.depth,
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        v_theta.parameters(), lr=cfg.optimiser.learning_rate
+        rngs=rngs,
     )
-
-    # fig = plot_MoG(
-    #     log_prob_function=target.log_prob,
-    #     samples=base.sample((2048,)),
-    #     name=cfg.wandb.name,
-    # )
-    # fig.savefig("target_distribution.png")
+    optimizer = nnx.Optimizer(v_theta, optax.adamw(cfg.optimiser.learning_rate), wrt=nnx.Param)
 
     wandb.init(
         project=cfg.wandb.project,
-        # config=cfg,
         name=cfg.wandb.name,
-        # mode="online",
     )
 
-    def diff_log_density(x):
-        # log p_1 - log p_0
+    def diff_log_density(x: jax.Array) -> jax.Array:
         return target.log_prob(x) - base.log_prob(x)
 
     num_timesteps = cfg.training.num_timesteps
@@ -71,106 +66,120 @@ def run(cfg):
     timesteps_for_loss = cfg.training.timesteps_for_loss
     batch_size = cfg.training.batch_size
     eps = 1e-5
-    timesteps = torch.linspace(eps, 1.0, num_timesteps).to(device)
-    dt = (1 - eps) / num_timesteps
+    timesteps = jnp.linspace(eps, 1.0, num_timesteps)
+    dt = (1.0 - eps) / num_timesteps
     delta_t = dt
-    for epoch in range(num_epochs):
 
+    def batch_loss(model: TimeVelocityField, batch_key: jax.Array) -> jax.Array:
+        k_sample, k_select, k_loop = jrandom.split(batch_key, 3)
+        x_t = base.sample(k_sample, (batch_size * 2,))
+
+        selected_indices = jrandom.permutation(k_select, num_timesteps)[:timesteps_for_loss]
+        is_selected = jnp.zeros((num_timesteps,), dtype=bool).at[selected_indices].set(True)
+
+        def body(i, carry):
+            samples, loss_acc, num_loss, inner_key = carry
+            t_scalar = timesteps[i]
+            t = jnp.full((samples.shape[0], 1), t_scalar)
+            velocity = lax.stop_gradient(model(samples, t))
+
+            def loss_branch(branch_carry):
+                current_samples, current_loss, current_num_loss, key_inner = branch_carry
+                key_u, key_inner = jrandom.split(key_inner)
+                u = jrandom.uniform(key_u, (batch_size, 1))
+                z_ts = current_samples[:batch_size]
+                z_te = current_samples[batch_size:]
+                z_t = (1.0 - u) * z_ts + u * z_te
+                t_ = u * delta_t + t[:batch_size]
+                weights = jax.nn.softmax(delta_t * diff_log_density(z_te), axis=0)
+                prediction = model(z_t, t_)
+                residual = prediction - (z_te - z_ts)
+                per_example = jnp.mean(residual**2, axis=-1)
+                weighted_loss = jnp.sum(per_example * weights)
+                return current_samples, current_loss + weighted_loss, current_num_loss + 1, key_inner
+
+            samples, loss_acc, num_loss, inner_key = lax.cond(
+                (t_scalar <= 1.0 - delta_t) & is_selected[i],
+                loss_branch,
+                lambda x: x,
+                (samples, loss_acc, num_loss, inner_key),
+            )
+
+            samples = samples + velocity * dt
+            return samples, loss_acc, num_loss, inner_key
+
+        init_carry = (
+            x_t,
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array(0, dtype=jnp.int32),
+            k_loop,
+        )
+        samples, loss_total, loss_count, _ = lax.fori_loop(0, num_timesteps, body, init_carry)
+        loss_count = jnp.maximum(loss_count, 1)
+        return loss_total / loss_count
+
+    for epoch in range(num_epochs):
         total_epoch_loss = 0.0
         for batch_idx in range(batches_per_epoch):
-            v_theta.train()
+            key, batch_key = jrandom.split(key)
 
-            loss = torch.tensor(0.0, device=device)
+            def loss_fn(model: TimeVelocityField) -> jax.Array:
+                return batch_loss(model, batch_key)
 
-            # We select only #timesteps_for_loss timesteps randomly for loss calculation to fit in memory
-            is_selected_timestep = torch.zeros(
-                num_timesteps, dtype=torch.bool
-            ).scatter_(0, torch.randperm(num_timesteps)[:timesteps_for_loss], True)
+            loss_value, grads = nnx.value_and_grad(loss_fn)(v_theta)
+            optimizer.update(v_theta, grads)
 
-            num_loss = 0
-            x_t = base.sample((batch_size * 2,)).to(device) # half for training; half for importance weight
-            loss = 0
-            for i in range(num_timesteps):
-                t = timesteps[i].expand(x_t.shape[0], 1)    # (B*2, 1)
-                with torch.no_grad():
-                    v_t = v_theta(x_t, t)
+            loss_float = float(jax.device_get(loss_value))
+            total_epoch_loss += loss_float
+            wandb.log({"train/loss": loss_float})
+            print(
+                f"Epoch [{epoch + 1}/{num_epochs}], "
+                f"Batch [{batch_idx + 1}/{batches_per_epoch}], "
+                f"Loss: {loss_float:.4f}"
+            )
 
-                if timesteps[i] <= 1 - delta_t and is_selected_timestep[i]:
-                    # Compute loss only for selected timesteps
-                    u = torch.rand((batch_size, 1), device=device) # (B, 1)
-                    z_ts = x_t[:batch_size, :]  # training samples (B, D)
-                    z_te = x_t[batch_size:, :]  # importance weight samples (B, D)
-
-                    # weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
-                    # indices = torch.multinomial(weights, num_samples=batch_size, replacement=True)
-                    # z_te = z_te[indices, :]  # (B, D)
-                    # z_t = (1 - u) * z_ts + u * z_te  # (B, D)
-                    # t_ = u * delta_t + t[:u.size(0), :]  # (B, 1)
-                    # loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean()
-
-                    z_t = (1 - u) * z_ts + u * z_te  # (B, D)
-                    t_ = u * delta_t + t[:u.size(0), :]  # (B, 1)
-                    weights = (delta_t * diff_log_density(z_te)).softmax(dim=-1)
-                    tmp_loss = ((v_theta(z_t, t_) - (z_te - z_ts))**2).mean(dim=-1)
-                    tmp_loss = (tmp_loss * weights).mean()
-
-                    loss += tmp_loss
-                    num_loss += 1
-
-                x_t = x_t + v_t * dt
-
-            loss = loss / num_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_epoch_loss += loss.item()
-            wandb.log({f"train/loss": loss.item()})
-            print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{batches_per_epoch}], Loss: {loss.item():.4f}")
-
-        v_theta.eval()
         avg_loss = total_epoch_loss / batches_per_epoch
-        wandb.log({f"train/avg_epoch_loss": avg_loss})
-        print(f"Epoch [{epoch+1}/{num_epochs}] completed. Avg Loss: {avg_loss:.4f}")
+        wandb.log({"train/avg_epoch_loss": avg_loss})
+        print(f"Epoch [{epoch + 1}/{num_epochs}] completed. Avg Loss: {avg_loss:.4f}")
 
         if epoch % 50 == 0:
-            initial_samples = base.sample((2048,)).to(device)
-            samples = generate_samples_with_euler_method(v_theta, initial_samples, ts=torch.linspace(0, 1, cfg.sampling.num_timesteps)).detach().cpu()  # (N, D)
-            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+            key, sample_key = jrandom.split(key)
+            initial_samples = base.sample(sample_key, (2048,))
+            ts = jnp.linspace(0.0, 1.0, cfg.sampling.num_timesteps)
+            samples = generate_samples_with_euler_method(v_theta, initial_samples, ts)
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 fig = plot_MoG(
-                        log_prob_function=target.log_prob,
-                        samples=samples, 
-                        name=cfg.wandb.name,
-                    )
+                    log_prob_function=target.log_prob,
+                    samples=samples,
+                    name=cfg.wandb.name,
+                )
                 fig.savefig(os.path.join(tmpdir, "samples.png"))
-                wandb.log({f"samples": wandb.Image(
-                    os.path.join(tmpdir, "samples.png")
-                )})
-                # wandb.log({f"samples": wandb.Image(fig)})
+                wandb.log({"samples": wandb.Image(os.path.join(tmpdir, "samples.png"))})
                 plt.close(fig)
 
-def generate_samples_with_euler_method(v_theta, initial_samples, ts):
-    """
-    Generate samples using the Euler method.
-        t = 0 -> t = 1 : noise -> data
-    """
-    device = initial_samples.device
-    samples = initial_samples
-    t_prev = ts[:-1]
-    t_next = ts[1:]
 
-    for t_p, t_n in zip(t_prev, t_next):
-        t = torch.ones(samples.size(0), device=device).unsqueeze(1) * t_p
-        with torch.no_grad():
-            samples = samples + v_theta(samples, t) * (t_n - t_p)
- 
-    return samples
+def generate_samples_with_euler_method(
+    v_theta: TimeVelocityField, initial_samples: jax.Array, ts: jax.Array
+) -> jax.Array:
+    """Generate samples with forward Euler integration over provided timesteps."""
+
+    def step(samples, t_pair):
+        t_p, t_n = t_pair
+        t = jnp.full((samples.shape[0], 1), t_p)
+        velocity = v_theta(samples, t)
+        samples = samples + velocity * (t_n - t_p)
+        return samples, samples
+
+    t_pairs = jnp.stack([ts[:-1], ts[1:]], axis=-1)
+    final_samples, _ = lax.scan(step, initial_samples, t_pairs)
+    return final_samples
+
 
 @hydra.main(config_path="./configs", config_name="gmm.yaml", version_base=None)
 def main(cfg: DictConfig) -> None:
-    seed_everything(cfg.seed)
     run(cfg)
+
 
 if __name__ == "__main__":
     main()

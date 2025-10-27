@@ -1,253 +1,237 @@
-import torch
+from __future__ import annotations
+
 import itertools
+from dataclasses import dataclass
+from typing import Callable, Sequence, Tuple
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 from matplotlib import pyplot as plt
 
-class GMM40(torch.nn.Module):
-    def __init__(self, dim, n_mixes, loc_scaling, log_var_scaling=1., seed=0,
-                 n_test_set_samples=1000, device="cpu"):
-        super(GMM40, self).__init__()
+Array = jax.Array
 
-        # fix mean and variance for reproducibility
-        torch.manual_seed(0)
-        self.n_mixes = n_mixes
-        self.dim = dim
-        self.n_test_set_samples = n_test_set_samples
-        self.dimensionality = 2
 
-        mean = (torch.rand((n_mixes, dim), ) - 0.5)*2 * loc_scaling
-        log_var = torch.ones((n_mixes, dim)) * log_var_scaling
+def _gaussian_log_prob(x: Array, loc: Array, scale_diag: Array) -> Array:
+    """Compute log N(x | loc, diag(scale_diag^2)) elementwise."""
+    diff = (x - loc) / scale_diag
+    log_det = 2.0 * jnp.log(scale_diag).sum(axis=-1)
+    dim = x.shape[-1]
+    norm = -0.5 * (dim * jnp.log(2 * jnp.pi) + log_det)
+    return norm - 0.5 * jnp.sum(diff**2, axis=-1)
 
-        self.register_buffer("cat_probs", torch.ones(n_mixes))
-        self.register_buffer("locs", mean)
-        self.register_buffer("scale_trils", torch.diag_embed(torch.nn.functional.softplus(log_var)))
-        self.device = device
-        self.to(self.device)
 
-        # reset seed
-        torch.manual_seed(seed)
+@dataclass
+class GMM40:
+    dim: int
+    n_mixes: int
+    loc_scaling: float
+    log_var_scaling: float = 1.0
+    seed: int = 0
+    n_test_set_samples: int = 1000
 
-    def to(self, device):
-        if device == "cuda":
-            if torch.cuda.is_available():
-                self.cuda()
-        else:
-            self.cpu()
+    def __post_init__(self):
+        key = jax.random.PRNGKey(self.seed)
+        key_mean, key = jax.random.split(key)
 
-    @property
-    def distribution(self):
-        mix = torch.distributions.Categorical(self.cat_probs.to(self.device))
-        com = torch.distributions.MultivariateNormal(self.locs.to(self.device),
-                                                     scale_tril=self.scale_trils.to(self.device),
-                                                     validate_args=False)
-        return torch.distributions.MixtureSameFamily(mixture_distribution=mix,
-                                                     component_distribution=com,
-                                                     validate_args=False)
+        self.locs = (
+            (jax.random.uniform(key_mean, (self.n_mixes, self.dim)) - 0.5)
+            * 2.0
+            * self.loc_scaling
+        )
+        log_var = jnp.ones((self.n_mixes, self.dim)) * self.log_var_scaling
+        self.scale_diag = jax.nn.softplus(log_var)
+        self.logits = jnp.zeros((self.n_mixes,))
+        self._key = key
 
     @property
-    def test_set(self) -> torch.Tensor:
-        return self.sample((self.n_test_set_samples, ))
+    def test_set(self) -> Array:
+        key, self._key = jax.random.split(self._key)
+        return self.sample(key, (self.n_test_set_samples,))
 
-    def log_prob(self, x: torch.Tensor):
-        log_prob = self.distribution.log_prob(x)
-        mask = torch.zeros_like(log_prob)
-        mask[log_prob < -1e4] = - torch.tensor(float("inf"))
-        log_prob = log_prob + mask
-        return log_prob
+    def log_prob(self, x: Array) -> Array:
+        x = jnp.atleast_2d(x)
+        diff = x[:, None, :] - self.locs[None, :, :]
+        scale = self.scale_diag[None, :, :]
+        log_components = _gaussian_log_prob(diff, jnp.zeros_like(diff), scale)
+        log_weights = jax.nn.log_softmax(self.logits)
+        return jax.scipy.special.logsumexp(log_weights + log_components, axis=1)
 
-    def sample(self, shape=(1,)):
-        return self.distribution.sample(shape)
+    def sample(self, key: Array, shape: Sequence[int] = ()) -> Array:
+        key_comp, key_noise = jax.random.split(key)
+        comps = jax.random.categorical(key_comp, self.logits, shape=shape)
+        locs = self.locs[comps]
+        scale = self.scale_diag[comps]
+        noise = jax.random.normal(key_noise, shape + (self.dim,))
+        return locs + noise * scale
 
-class GMM9(torch.nn.Module):
-    def __init__(self, dim=2, scale=4., std=1., seed=0,
-                 n_test_set_samples=1000, device="cpu"):
-        super(GMM9, self).__init__()
 
+@dataclass
+class GMM9:
+    dim: int = 2
+    scale: float = 4.0
+    std: float = 1.0
+    seed: int = 0
+    n_test_set_samples: int = 1000
+
+    def __post_init__(self):
         self.n_mixes = 9
-        self.n_test_set_samples = n_test_set_samples
         self.dimensionality = 2
-
-        mean = torch.tensor(
-            [[-scale, -scale], [-scale, scale], [scale, scale], [scale, -scale], [-scale, 0.0], [scale, 0.0], [0.0, -scale], [0.0, scale], [0.0, 0.0]])
-        
-        self.std = std
-
-        self.register_buffer("cat_probs", torch.ones(self.n_mixes) / 8)
-        self.register_buffer("locs", mean)
-        self.device = device
-        self.to(self.device)
-
-    def to(self, device):
-        if device == "cuda":
-            if torch.cuda.is_available():
-                self.cuda()
-        else:
-            self.cpu()
-
-    @property
-    def distribution(self):
-        mix = torch.distributions.Categorical(self.cat_probs.to(self.device))
-        com = torch.distributions.Independent(
-                torch.distributions.Normal(
-                    self.locs.to(self.device),
-                    (torch.ones(self.n_mixes, self.dimensionality) * self.std).to(self.device),
-                ),
-                1
+        self.locs = jnp.array(
+            [
+                [-self.scale, -self.scale],
+                [-self.scale, self.scale],
+                [self.scale, self.scale],
+                [self.scale, -self.scale],
+                [-self.scale, 0.0],
+                [self.scale, 0.0],
+                [0.0, -self.scale],
+                [0.0, self.scale],
+                [0.0, 0.0],
+            ]
         )
-        return torch.distributions.MixtureSameFamily(mixture_distribution=mix,
-                                                     component_distribution=com)
+        self.scale_diag = jnp.ones((self.n_mixes, self.dimensionality)) * self.std
+        self.logits = jnp.zeros((self.n_mixes,))
+        self._key = jax.random.PRNGKey(self.seed)
 
     @property
-    def test_set(self) -> torch.Tensor:
-        return self.sample((self.n_test_set_samples, ))
+    def test_set(self) -> Array:
+        key, self._key = jax.random.split(self._key)
+        return self.sample(key, (self.n_test_set_samples,))
 
-    def log_prob(self, x: torch.Tensor):
-        return self.distribution.log_prob(x)
+    def log_prob(self, x: Array) -> Array:
+        x = jnp.atleast_2d(x)
+        diff = x[:, None, :] - self.locs[None, :, :]
+        scale = self.scale_diag[None, :, :]
+        log_components = _gaussian_log_prob(diff, jnp.zeros_like(diff), scale)
+        log_weights = jax.nn.log_softmax(self.logits)
+        return jax.scipy.special.logsumexp(log_weights + log_components, axis=1)
 
-    def sample(self, shape=(1,)):
-        return self.distribution.sample(shape)
+    def sample(self, key: Array, shape: Sequence[int] = ()) -> Array:
+        key_comp, key_noise = jax.random.split(key)
+        comps = jax.random.categorical(key_comp, self.logits, shape=shape)
+        locs = self.locs[comps]
+        scale = self.scale_diag[comps]
+        noise = jax.random.normal(key_noise, shape + (self.dimensionality,))
+        return locs + noise * scale
 
+
+@dataclass
 class MultivariateGaussian:
-    """
-    Multivariate Gaussian Distribution with Sigma * I covariance.
+    dim: int = 2
+    sigma: float | Array = 1.0
 
-    Parameters:
-    - dim: int
-        Dimensionality of the Gaussian.
-    - sigma: float or jnp.ndarray, default=1.0
-        Standard deviation of the distribution. If a float is provided, the same sigma is used for all dimensions.
-        If an array is provided, it should have shape (dim,) for per-dimension sigma.
-    - plot_bound_factor: float, default=3.0
-        Factor to determine the plotting bounds based on sigma.
-    """
+    def __post_init__(self):
+        sigma = jnp.asarray(self.sigma)
+        if sigma.ndim == 0:
+            sigma = jnp.ones((self.dim,)) * sigma
+        if sigma.shape[0] != self.dim:
+            raise ValueError(f"Sigma shape {sigma.shape} does not match dimension {self.dim}.")
+        self.scale_diag = sigma
 
-    def __init__(
-        self, dim: int = 2, sigma: float = 1.0, device: str = 'cuda', **kwargs
-    ):
-        """
-        Initializes the MultivariateGaussian distribution.
+    def log_prob(self, x: Array) -> Array:
+        x = jnp.atleast_2d(x)
+        return _gaussian_log_prob(x, jnp.zeros(self.dim), self.scale_diag)
 
-        Args:
-            dim (int): Dimensionality of the Gaussian.
-            sigma (float or np.array): Standard deviation(s). Scalar for isotropic, array for anisotropic.
-            plot_bound_factor (float): Factor to determine the plotting bounds.
-            **kwargs: Additional arguments to pass to the base Target class.
-        """
-        dtype = torch.float32
-
-        self.sigma = np.array(sigma)
-        if self.sigma.ndim == 0:
-            # Scalar sigma: isotropic covariance
-            scale_diag = torch.ones(dim, dtype=dtype) * torch.tensor(self.sigma, dtype=dtype)
-        else:
-            # Per-dimension sigma
-            if self.sigma.shape[0] != dim:
-                raise ValueError(
-                    f"Sigma shape {self.sigma.shape} does not match dimension {dim}."
-                )
-            scale_diag = torch.tensor(self.sigma, dtype=dtype)
-
-        self.distribution = torch.distributions.MultivariateNormal(
-            loc=torch.zeros(dim, device=device, dtype=dtype), 
-            covariance_matrix=torch.diag(scale_diag ** 2).to(device)
-        )
+    def sample(self, key: Array, shape: Sequence[int]) -> Array:
+        noise = jax.random.normal(key, shape + (self.dim,))
+        return noise * self.scale_diag
 
 
-    def log_prob(self, x):
-        """
-        Computes the log probability density of the input samples.
-
-        Args:
-            x (torch.Tensor): Input samples with shape (..., dim).
-
-        Returns:
-            torch.Tensor: Log probability densities.
-        """
-        return self.distribution.log_prob(x)
-
-    def sample(self, sample_shape):
-        """
-        Generates samples from the distribution.
-
-        Args:
-            sample_shape (torch.Size): Shape of the samples to generate.
-
-        Returns:
-            torch.Tensor: Generated samples with shape `sample_shape + (dim,)`.
-        """
-        return self.distribution.sample(sample_shape=sample_shape)
-
-
-def plot_contours(log_prob_func,
-                  samples = None,
-                  ax = None,
-                  bounds = (-5.0, 5.0),
-                  xy_ticks=(-40, 40),
-                  grid_width_n_points = 20,
-                  n_contour_levels = None,
-                  log_prob_min = -1000.0,
-                  device='cpu',
-                  plot_marginal_dims=[0, 1],
-                  s=2,
-                  alpha=0.6,
-                  title=None,
-                  plt_show=True,
-                  xy_tick=True,):
-    """Plot contours of a log_prob_func that is defined on 2D"""
+def plot_contours(
+    log_prob_func: Callable[[Array], Array],
+    samples: Array | None = None,
+    ax=None,
+    bounds: Tuple[float, float] = (-5.0, 5.0),
+    xy_ticks: Tuple[float, float] = (-40.0, 40.0),
+    grid_width_n_points: int = 20,
+    n_contour_levels: int | None = None,
+    log_prob_min: float = -1000.0,
+    plot_marginal_dims: Tuple[int, int] = (0, 1),
+    s: float = 2.0,
+    alpha: float = 0.6,
+    title: str | None = None,
+    plt_show: bool = True,
+    xy_tick: bool = True,
+):
+    """Plot contours of a log probability function defined on 2D space."""
     if ax is None:
         fig, ax = plt.subplots(1)
-    x_points_dim1 = torch.linspace(bounds[0], bounds[1], grid_width_n_points)
-    x_points_dim2 = x_points_dim1
-    x_points = torch.tensor(list(itertools.product(x_points_dim1, x_points_dim2)), device=device)
-    log_p_x = log_prob_func(x_points).cpu().detach()
-    log_p_x = torch.clamp_min(log_p_x, log_prob_min)
-    log_p_x = log_p_x.reshape((grid_width_n_points, grid_width_n_points))
-    x_points_dim1 = x_points[:, 0].reshape((grid_width_n_points, grid_width_n_points)).cpu().numpy()
-    x_points_dim2 = x_points[:, 1].reshape((grid_width_n_points, grid_width_n_points)).cpu().numpy()
-    if n_contour_levels:
-        ax.contour(x_points_dim1, x_points_dim2, log_p_x, levels=n_contour_levels)
     else:
-        ax.contour(x_points_dim1, x_points_dim2, log_p_x)
+        fig = ax.figure
+
+    x_points_dim1 = np.linspace(bounds[0], bounds[1], grid_width_n_points)
+    x_points_dim2 = x_points_dim1
+    x_points = np.array(list(itertools.product(x_points_dim1, x_points_dim2)), dtype=np.float32)
+    log_p_x = np.array(log_prob_func(jnp.asarray(x_points)))
+    log_p_x = np.clip(log_p_x, log_prob_min, None)
+    log_p_x = log_p_x.reshape((grid_width_n_points, grid_width_n_points))
+
+    grid_x = x_points[:, 0].reshape((grid_width_n_points, grid_width_n_points))
+    grid_y = x_points[:, 1].reshape((grid_width_n_points, grid_width_n_points))
+    if n_contour_levels:
+        ax.contour(grid_x, grid_y, log_p_x, levels=n_contour_levels)
+    else:
+        ax.contour(grid_x, grid_y, log_p_x)
 
     if samples is not None:
-        samples = np.clip(samples, bounds[0], bounds[1])
-        ax.scatter(samples[:, plot_marginal_dims[0]], samples[:, plot_marginal_dims[1]], s=s, alpha=alpha)
-        ### x,y ticks
+        samples_np = np.asarray(samples)
+        samples_np = np.clip(samples_np, bounds[0], bounds[1])
+        ax.scatter(
+            samples_np[:, plot_marginal_dims[0]],
+            samples_np[:, plot_marginal_dims[1]],
+            s=s,
+            alpha=alpha,
+        )
         if xy_tick:
-            ax.set_xticks([xy_ticks[0],0,xy_ticks[1]])
-            ax.set_yticks([xy_ticks[0],0,xy_ticks[1]])
-        ### size of ticks
-        ax.tick_params(axis='both', which='major', labelsize=15)
+            ax.set_xticks([xy_ticks[0], 0.0, xy_ticks[1]])
+            ax.set_yticks([xy_ticks[0], 0.0, xy_ticks[1]])
+        ax.tick_params(axis="both", which="major", labelsize=15)
     if title:
         ax.set_title(title)
-        ### size of title 
         ax.title.set_fontsize(40)
     if plt_show:
         plt.show()
-
     return fig
 
-def plot_heat(log_prob_function, samples, size=4.5):
+
+def plot_heat(log_prob_function: Callable[[Array], Array], samples: Array, size: float = 4.5):
     w = 100
     x = np.linspace(-size, size, w)
     y = np.linspace(-size, size, w)
     xx, yy = np.meshgrid(x, y)
-    xx = np.reshape(xx, [-1, 1])
-    yy = np.reshape(yy, [-1, 1])
-    data = torch.from_numpy(np.concatenate((xx, yy), axis=-1)).to("cuda").float()
-    heat_score = log_prob_function(data).exp().cpu().detach().numpy()
+    grid = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1).astype(np.float32)
+    heat_score = np.exp(np.array(log_prob_function(jnp.asarray(grid))))
     fig = plt.figure(figsize=(4, 4))
-    plt.imshow(heat_score.reshape(w, w), extent=(-size, size, -size, size), origin='lower')
-    plt.scatter(samples[:, 0], samples[:, 1], c='r', s=1)
+    plt.imshow(heat_score.reshape(w, w), extent=(-size, size, -size, size), origin="lower")
+    samples_np = np.asarray(samples)
+    plt.scatter(samples_np[:, 0], samples_np[:, 1], c="r", s=1)
     return fig
 
 
-def plot_MoG(log_prob_function, samples, name='GMM40', save_path=None, save_name=None,title=None):
-    if name == 'GMM40':
-        fig = plot_contours(log_prob_function, samples=samples.detach().cpu().numpy(), bounds=(-56,56), n_contour_levels=50, grid_width_n_points=200, device="cuda",title=title,plt_show=False)
+def plot_MoG(
+    log_prob_function: Callable[[Array], Array],
+    samples: Array,
+    name: str = "GMM40",
+    save_path: str | None = None,
+    save_name: str | None = None,
+    title: str | None = None,
+):
+    if name == "GMM40":
+        fig = plot_contours(
+            log_prob_function,
+            samples=samples,
+            bounds=(-56, 56),
+            n_contour_levels=50,
+            grid_width_n_points=200,
+            title=title,
+            plt_show=False,
+        )
     elif name == "GMM9":
-        fig = plot_heat(log_prob_function, samples=samples.detach().cpu().numpy())
+        fig = plot_heat(log_prob_function, samples=samples)
     else:
         raise NotImplementedError
-    
+
+    if save_path and save_name:
+        fig.savefig(f"{save_path}/{save_name}")
     return fig

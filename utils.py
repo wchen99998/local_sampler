@@ -1,11 +1,12 @@
 import random
+
 import numpy as np
-import torch
+import jax
+from jax import random as jrandom
 
 
-def seed_everything(seed):
+def seed_everything(seed: int) -> jax.Array:
+    """Seed Python, NumPy, and return a base JAX PRNGKey."""
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    return jrandom.PRNGKey(seed)
