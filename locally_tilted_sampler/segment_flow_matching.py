@@ -219,17 +219,23 @@ def propagate_flow_sequence(
     random_walk_steps: int = 0,
     random_walk_std: float = 0.0,
 ) -> Array | List[Array]:
-    if random_walk_steps > 0 and random_walk_std > 0.0:
-        key, rw_key = jax.random.split(key)
-        samples = apply_random_walk(rw_key, samples, random_walk_steps, random_walk_std)
+    use_random_walk = random_walk_steps > 0 and random_walk_std > 0.0
 
-    history: List[Array] = [samples] if return_all else []
     x = samples
-    for flow in flows:
+    if use_random_walk:
+        key, rw_key = jax.random.split(key)
+        x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
+
+    history: List[Array] = [x] if return_all else []
+    for idx, flow in enumerate(flows):
         key, subkey = jax.random.split(key)
         x = apply_single_flow(subkey, flow, x, solver_substeps)
         if return_all:
             history.append(x)
+        if use_random_walk and idx < len(flows) - 1:
+            key, rw_key = jax.random.split(key)
+            x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
+
     return history if return_all else x
 
 
