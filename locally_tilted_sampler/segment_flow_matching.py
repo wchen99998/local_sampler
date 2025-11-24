@@ -67,7 +67,8 @@ def make_random_pair_sampler(
     @nnx.jit(static_argnums=2)
     def _fn(key: jax.Array, xbatch: Array, delta_t: float) -> Tuple[Array, Array]:
         """Return (child, parent) pairs where parents are sampled uniformly (no ancestry)."""
-        x_is, _ = importance_sampler(key, xbatch, delta_t)
+        key, is_key = jax.random.split(key)
+        x_is, _ = importance_sampler(is_key, xbatch, delta_t)
         parent_idx = jax.random.randint(key, (xbatch.shape[0],), 0, xbatch.shape[0])
         return x_is, parent_idx
 
