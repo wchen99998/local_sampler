@@ -40,8 +40,10 @@ fig.savefig("target_density.png")
 
 # In notebooks, you can live-plot losses:
 # from locally_tilted_sampler import LiveLossPlot
-# live = LiveLossPlot()
-# config = config.replace(loss_callback=live.update)  # or rebuild TrainingConfig with loss_callback=live.update
+# import dataclasses as dc
+# live = LiveLossPlot(title="Segment flow matching", traj_bounds=(-6, 6))
+# config = dc.replace(config, loss_callback=live.update)  # or rebuild TrainingConfig with loss_callback=live.update
+# The live plot shows loss plus per-stage 2D trajectory panels (prior, random walks, per-flow states; 200 pts each).
 PY
 ```
 

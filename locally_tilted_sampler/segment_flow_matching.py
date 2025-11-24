@@ -37,7 +37,9 @@ class TrainingConfig:
     use_stratified_coupling: bool = False
     random_walk_std: float = 0.0
     random_walk_steps: int = 0
-    loss_callback: callable | None = None
+    loss_callback: Callable[
+        [int, int, float, float, float, Sequence[Tuple[str, Array]] | None], None
+    ] | None = None
     optimizer: str = "adamw"  # choices: adamw, adam, muon
     optimizer_kwargs: Mapping[str, float] = field(default_factory=dict)
     log_every: int = DEFAULT_LOG_EVERY
@@ -224,11 +226,14 @@ def propagate_flow_sequence(
     use_random_walk = random_walk_steps > 0 and random_walk_std > 0.0
 
     x = samples
+    history: List[Array] = [x] if return_all else []
+
     if use_random_walk:
         key, rw_key = jax.random.split(key)
         x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
+        if return_all:
+            history.append(x)
 
-    history: List[Array] = [x] if return_all else []
     for idx, flow in enumerate(flows):
         key, subkey = jax.random.split(key)
         x = apply_single_flow(subkey, flow, x, solver_substeps)
@@ -237,6 +242,8 @@ def propagate_flow_sequence(
         if use_random_walk and idx < len(flows) - 1:
             key, rw_key = jax.random.split(key)
             x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
+            if return_all:
+                history.append(x)
 
     return history if return_all else x
 
@@ -268,6 +275,8 @@ def train_locally_tilted_sampler(
 
     t = 0.0
     epsilon = 1e-6
+    use_random_walk = config.random_walk_steps > 0 and config.random_walk_std > 0.0
+    viz_points = max(1, min(200, config.train_samples))
 
     def build_epoch_batches(rng: jax.Array) -> Tuple[Array, jax.Array]:
         perm_key, pad_key, next_key = jax.random.split(rng, 3)
@@ -298,6 +307,26 @@ def train_locally_tilted_sampler(
             random_walk_std=config.random_walk_std,
         )
         return new_samples, next_key
+
+    def build_trajectory_chain(
+        rng: jax.Array, flows_for_viz: Sequence[FlowMLP]
+    ) -> Tuple[List[Tuple[str, Array]], jax.Array]:
+        rng, sample_key = jax.random.split(rng)
+        x = prior.sample(sample_key, (viz_points,))
+        stages: List[Tuple[str, Array]] = [("prior", x)]
+        if use_random_walk:
+            rng, rw_key = jax.random.split(rng)
+            x = apply_random_walk(rw_key, x, config.random_walk_steps, config.random_walk_std)
+            stages.append(("rw_0", x))
+        for idx, flow in enumerate(flows_for_viz):
+            rng, flow_key = jax.random.split(rng)
+            x = apply_single_flow(flow_key, flow, x, config.solver_substeps)
+            stages.append((f"flow_{idx + 1}", x))
+            if use_random_walk and idx < len(flows_for_viz) - 1:
+                rng, rw_key = jax.random.split(rng)
+                x = apply_random_walk(rw_key, x, config.random_walk_steps, config.random_walk_std)
+                stages.append((f"rw_{idx + 1}", x))
+        return stages, rng
 
     # Build jitted samplers once.
     importance_sampler = make_importance_sampler(target.log_prob, prior.log_prob)
@@ -331,7 +360,7 @@ def train_locally_tilted_sampler(
             if step > 0 and epoch_step == 0:
                 samples, key = refresh_training_samples(key, flows)
                 epoch_batches, key = build_epoch_batches(key)
-            if config.random_walk_steps > 0 and config.random_walk_std > 0.0:
+            if use_random_walk:
                 key, is_key, loss_key, rw_key = jax.random.split(key, 4)
             else:
                 key, is_key, loss_key = jax.random.split(key, 3)
@@ -347,15 +376,22 @@ def train_locally_tilted_sampler(
                 x_is, parents = random_pair_sampler(is_key, xbatch, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
-            if step % config.log_every == 0 and config.loss_callback is None:
+
+            should_log = step % config.log_every == 0
+            trajectories = None
+            if config.loss_callback is not None and should_log:
+                trajectories, key = build_trajectory_chain(key, [*flows, flow])
+
+            if should_log and config.loss_callback is None:
                 print(f"  step {step:04d}  loss={float(loss_val):.6f}")
-            if config.loss_callback is not None and step % config.log_every == 0:
+            if should_log and config.loss_callback is not None:
                 config.loss_callback(
                     len(flows),  # time slice index
                     step,
                     float(loss_val),
                     float(t),
                     float(delta_t),
+                    trajectories,
                 )
             if float(loss_val) < config.threshold:
                 break
@@ -366,12 +402,14 @@ def train_locally_tilted_sampler(
         time_points.append(t)
         print(f"[time slice end]  t={t:.4f}, loss={float(loss_val):.6f}")
         if config.loss_callback is not None:
+            trajectories, key = build_trajectory_chain(key, flows)
             config.loss_callback(
                 len(flows) - 1,
                 step,
                 float(loss_val),
                 float(t),
                 float(delta_t),
+                trajectories,
             )
 
         samples, key = refresh_training_samples(key, flows)

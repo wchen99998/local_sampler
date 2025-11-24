@@ -346,7 +346,7 @@ wheels = [
 [[package]]
 name = "locally-tilted-sampler"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "flax" },
     { name = "jax" },
