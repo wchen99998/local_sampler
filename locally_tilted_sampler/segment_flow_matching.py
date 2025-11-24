@@ -34,6 +34,9 @@ class TrainingConfig:
     t_end: float = 1.0
     dtmax: float | None = None
     use_ancestral_pairs: bool = True
+    use_stratified_coupling: bool = False
+    random_walk_std: float = 0.0
+    random_walk_steps: int = 0
     loss_callback: callable | None = None
     optimizer: str = "adamw"  # choices: adamw, adam, muon
     log_every: int = DEFAULT_LOG_EVERY
@@ -61,18 +64,82 @@ def make_importance_sampler(
     return _fn
 
 
+def make_ancestral_pair_sampler(
+    target_log_prob: Callable[[Array], Array],
+    prior_log_prob: Callable[[Array], Array],
+    use_stratified: bool,
+):
+    @nnx.jit(static_argnums=2)
+    def _fn(key: jax.Array, xbatch: Array, delta_t: float) -> Tuple[Array, Array]:
+        log_prob_diff = target_log_prob(xbatch) - prior_log_prob(xbatch)
+        weights = jax.nn.softmax(delta_t * log_prob_diff)
+        key_resample, key_cpl = jax.random.split(key)
+        if use_stratified:
+            parent_idx, child_idx = stratified_coupling(key_cpl, xbatch, weights)
+            return xbatch[child_idx], parent_idx
+        idx = jax.random.choice(
+            key_resample, xbatch.shape[0], shape=(xbatch.shape[0],), p=weights
+        )
+        return xbatch[idx], idx
+
+    return _fn
+
+
+def apply_random_walk(key: jax.Array, x: Array, steps: int, step_std: float) -> Array:
+    if steps <= 0 or step_std <= 0.0:
+        return x
+    scale = step_std * jnp.sqrt(float(steps))
+    noise = jax.random.normal(key, x.shape) * scale
+    return x + noise
+
+
 def make_random_pair_sampler(
     importance_sampler: Callable[[jax.Array, Array, float], Tuple[Array, Array]]
 ):
     @nnx.jit(static_argnums=2)
     def _fn(key: jax.Array, xbatch: Array, delta_t: float) -> Tuple[Array, Array]:
-        """Return (child, parent) pairs where parents are sampled uniformly (no ancestry)."""
-        key, is_key = jax.random.split(key)
-        x_is, _ = importance_sampler(is_key, xbatch, delta_t)
-        parent_idx = jax.random.randint(key, (xbatch.shape[0],), 0, xbatch.shape[0])
+        """Return (child, parent) pairs with parents as the current batch order.
+
+        Endpoints are importance-resampled; parents stay aligned to ``xbatch`` positions.
+        """
+        x_is, _ = importance_sampler(key, xbatch, delta_t)
+        parent_idx = jnp.arange(xbatch.shape[0], dtype=jnp.int32)
         return x_is, parent_idx
 
     return _fn
+
+
+def stratified_coupling(key: jax.Array, x: Array, w: Array) -> Tuple[Array, Array]:
+    """Stratified resampling that keeps parents and children monotone along a random ray.
+
+    Args:
+        key: PRNG key.
+        x: Points to couple, shape (N, dim).
+        w: Non-negative weights for ``x``; they are normalized internally.
+
+    Returns:
+        parent_idx: Indices of ``x`` sorted along the random projection.
+        child_idx: Coupled resampled indices, matched to ``parent_idx`` order.
+    """
+
+    n = x.shape[0]
+    key_r, key_u = jax.random.split(key)
+
+    direction = jax.random.normal(key_r, (x.shape[1],))
+    direction = direction / (jnp.linalg.norm(direction) + 1e-12)
+
+    order = jnp.argsort(x @ direction)
+    weights = jnp.asarray(w)[order]
+    weights = weights / (jnp.sum(weights) + 1e-12)
+
+    cdf = jnp.cumsum(weights)
+    u0 = jax.random.uniform(key_u, ())
+    u = (jnp.arange(n, dtype=weights.dtype) + u0) / float(n)
+
+    child_pos = jnp.searchsorted(cdf, u, side="left")
+    child_idx = order[child_pos]
+    parent_idx = order
+    return parent_idx, child_idx
 
 
 def compute_weighted_loss(
@@ -109,7 +176,7 @@ def _build_optimizer(name: str, lr: float, weight_decay: float):
     if name == "adam":
         return optax.adam(learning_rate=lr)
     if name == "muon":
-       return optax.contrib.muon(learning_rate=lr, weight_decay=weight_decay)
+        return optax.contrib.muon(learning_rate=lr, weight_decay=weight_decay)
     raise ValueError(f"Unknown optimizer '{name}'. Expected one of ['adamw', 'adam', 'muon'].")
 
 
@@ -149,7 +216,13 @@ def propagate_flow_sequence(
     samples: Array,
     solver_substeps: int,
     return_all: bool = False,
+    random_walk_steps: int = 0,
+    random_walk_std: float = 0.0,
 ) -> Array | List[Array]:
+    if random_walk_steps > 0 and random_walk_std > 0.0:
+        key, rw_key = jax.random.split(key)
+        samples = apply_random_walk(rw_key, samples, random_walk_steps, random_walk_std)
+
     history: List[Array] = [samples] if return_all else []
     x = samples
     for flow in flows:
@@ -185,6 +258,9 @@ def train_locally_tilted_sampler(
 
     # Build jitted samplers once.
     importance_sampler = make_importance_sampler(target.log_prob, prior.log_prob)
+    ancestral_pair_sampler = make_ancestral_pair_sampler(
+        target.log_prob, prior.log_prob, config.use_stratified_coupling
+    )
     random_pair_sampler = make_random_pair_sampler(importance_sampler)
 
     while t < config.t_end - epsilon:
@@ -200,13 +276,21 @@ def train_locally_tilted_sampler(
 
         loss_val = jnp.inf
         for step in range(config.max_updates):
-            key, batch_key, is_key, loss_key = jax.random.split(key, 4)
+            if config.random_walk_steps > 0 and config.random_walk_std > 0.0:
+                key, batch_key, is_key, loss_key, rw_key = jax.random.split(key, 5)
+            else:
+                key, batch_key, is_key, loss_key = jax.random.split(key, 4)
+                rw_key = None
             idx = jax.random.choice(
                 batch_key, config.train_samples, (config.train_batch_size,), replace=False
             )
             xbatch = samples[idx]
+            if rw_key is not None:
+                xbatch = apply_random_walk(
+                    rw_key, xbatch, config.random_walk_steps, config.random_walk_std
+                )
             if config.use_ancestral_pairs:
-                x_is, parents = importance_sampler(is_key, xbatch, delta_t)
+                x_is, parents = ancestral_pair_sampler(is_key, xbatch, delta_t)
             else:
                 x_is, parents = random_pair_sampler(is_key, xbatch, delta_t)
             x_parents = xbatch[parents]
@@ -246,6 +330,8 @@ def train_locally_tilted_sampler(
             samples,
             config.solver_substeps,
             return_all=False,
+            random_walk_steps=config.random_walk_steps,
+            random_walk_std=config.random_walk_std,
         )
 
     return TrainResult(

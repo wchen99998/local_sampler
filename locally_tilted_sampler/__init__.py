@@ -13,6 +13,7 @@ from .segment_flow_matching import (
     TrainResult,
     apply_single_flow,
     propagate_flow_sequence,
+    stratified_coupling,
     train_locally_tilted_sampler,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "TrainResult",
     "apply_single_flow",
     "propagate_flow_sequence",
+    "stratified_coupling",
     "train_locally_tilted_sampler",
     "make_gmm9",
     "make_gmm40",
