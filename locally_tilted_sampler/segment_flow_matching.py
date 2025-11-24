@@ -21,15 +21,14 @@ class Density(Protocol):
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    nstep: int = 256
-    nstep_per_grid: int = 32
+    time_slices: int = 256
+    solver_substeps: int = 32
     lr: float = 1e-3
     weight_decay: float = 1e-6
     epochs: int = 1000
-    nsample: int = 20000
-    nbatch: int = 1024
+    train_samples: int = 20000
+    train_batch_size: int = 1024
     threshold: float = 1e-5
-    jump_kernel_std: float = 0.0
     seed: int = 0
     t_end: float = 1.0
     dtmax: float | None = None
@@ -43,13 +42,6 @@ class TrainResult:
     final_samples: Array
 
 
-def apply_jump_kernel(key: jax.Array, x: Array, std: float) -> Array:
-    if std <= 0.0:
-        return x
-    noise = jax.random.normal(key, x.shape, dtype=x.dtype)
-    return x + std * noise
-
-
 def importance_sample_batch(
     key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
 ) -> Tuple[Array, Array]:
@@ -60,22 +52,22 @@ def importance_sample_batch(
 
 
 def compute_weighted_loss(
-    flow: FlowMLP, key: jax.Array, x_ts: Array, x_te: Array, jump_kernel_std: float
+    flow: FlowMLP, key: jax.Array, x_ts: Array, x_te: Array
 ) -> Array:
     key_t, key_noise = jax.random.split(key)
     t = jax.random.uniform(key_t, (x_ts.shape[0], 1), dtype=x_ts.dtype)
-    x_start = apply_jump_kernel(key_noise, x_ts, jump_kernel_std)
+    x_start = x_ts
     x_t = (1.0 - t) * x_start + t * x_te
     v_t = flow(x_t, t)
     diff = v_t - (x_te - x_start)
     return jnp.mean(jnp.sum(diff * diff, axis=-1))
 
 
-def make_train_step(jump_kernel_std: float):
+def make_train_step():
     @nnx.jit
     def train_step(flow: FlowMLP, optimizer: nnx.Optimizer, key: jax.Array, x_ts: Array, x_te: Array):
         def loss_fn(model: FlowMLP):
-            return compute_weighted_loss(model, key, x_ts, x_te, jump_kernel_std)
+            return compute_weighted_loss(model, key, x_ts, x_te)
 
         loss, grads = nnx.value_and_grad(
             loss_fn, argnums=nnx.DiffState(0, nnx.Param)
@@ -97,11 +89,10 @@ def apply_single_flow(
     key: jax.Array,
     flow: FlowMLP,
     samples: Array,
-    nstep_per_grid: int,
-    jump_kernel_std: float = 0.0,
+    solver_substeps: int,
 ) -> Array:
-    samples = apply_jump_kernel(key, samples, jump_kernel_std)
-    ts = jnp.linspace(0.0, 1.0, nstep_per_grid, dtype=samples.dtype)
+    samples = samples
+    ts = jnp.linspace(0.0, 1.0, solver_substeps, dtype=samples.dtype)
     x = samples
     for t_prev, t_next in zip(ts[:-1], ts[1:]):
         t_val = jnp.full((x.shape[0], 1), t_prev, dtype=x.dtype)
@@ -114,15 +105,14 @@ def propagate_flow_sequence(
     key: jax.Array,
     flows: Sequence[FlowMLP],
     samples: Array,
-    nstep_per_grid: int,
-    jump_kernel_std: float = 0.0,
+    solver_substeps: int,
     return_all: bool = False,
 ) -> Array | List[Array]:
     history: List[Array] = [samples] if return_all else []
     x = samples
     for flow in flows:
         key, subkey = jax.random.split(key)
-        x = apply_single_flow(subkey, flow, x, nstep_per_grid, jump_kernel_std)
+        x = apply_single_flow(subkey, flow, x, solver_substeps)
         if return_all:
             history.append(x)
     return history if return_all else x
@@ -137,11 +127,11 @@ def train_locally_tilted_sampler(
     if not (0.0 < config.t_end <= 1.0):
         raise ValueError("t_end must be in (0, 1].")
 
-    dtmax = 1.0 / config.nstep if config.dtmax is None else config.dtmax
+    dtmax = 1.0 / config.time_slices if config.dtmax is None else config.dtmax
     key = jax.random.PRNGKey(config.seed)
 
     key, sample_key = jax.random.split(key)
-    samples = prior.sample(sample_key, (config.nsample,))
+    samples = prior.sample(sample_key, (config.train_samples,))
 
     flows: List[FlowMLP] = []
     time_points: List[float] = []
@@ -155,7 +145,7 @@ def train_locally_tilted_sampler(
         delta_t = float(min(dtmax, config.t_end - t))
         key, init_key = jax.random.split(key)
         flow, optimizer = init_flow(flow_dims, init_key, config.lr, config.weight_decay)
-        train_step = make_train_step(config.jump_kernel_std)
+        train_step = make_train_step()
 
         if not printed_params:
             print_parameter_counts(flow, module_name="Flow", max_depth=3)
@@ -164,7 +154,9 @@ def train_locally_tilted_sampler(
         loss_val = jnp.inf
         for _ in range(config.epochs):
             key, batch_key, is_key, loss_key = jax.random.split(key, 4)
-            idx = jax.random.choice(batch_key, config.nsample, (config.nbatch,), replace=False)
+            idx = jax.random.choice(
+                batch_key, config.train_samples, (config.train_batch_size,), replace=False
+            )
             xbatch = samples[idx]
             x_is, parents = importance_sample_batch(is_key, xbatch, target, prior, delta_t)
             x_parents = xbatch[parents]
@@ -180,10 +172,9 @@ def train_locally_tilted_sampler(
         key, prop_key = jax.random.split(key)
         samples = propagate_flow_sequence(
             prop_key,
-            [flow],
+            flows,
             samples,
-            config.nstep_per_grid,
-            jump_kernel_std=config.jump_kernel_std,
+            config.solver_substeps,
             return_all=False,
         )
 

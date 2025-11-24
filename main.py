@@ -33,15 +33,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run Locally Tilted Sampler training (JAX/NNX).")
     p.add_argument("--target", choices=["gmm9", "gmm40"], default="gmm9")
     p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--nsample", type=int, default=1024)
-    p.add_argument("--nbatch", type=int, default=256)
-    p.add_argument("--nstep", type=int, default=64)
-    p.add_argument("--nstep-per-grid", type=int, default=16, dest="nstep_per_grid")
+    p.add_argument("--train-samples", type=int, default=1024, dest="train_samples")
+    p.add_argument("--train-batch-size", type=int, default=256, dest="train_batch_size")
+    p.add_argument("--time-slices", type=int, default=64, dest="time_slices")
+    p.add_argument("--solver-substeps", type=int, default=16, dest="solver_substeps")
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--jump-kernel-std", type=float, default=0.0, dest="jump_kernel_std")
     p.add_argument("--t-end", type=float, default=1.0, dest="t_end")
     p.add_argument("--plot-target", type=Path, default=None, dest="plot_path")
     return p.parse_args()
@@ -52,14 +51,13 @@ def main():
     prior, target = build_densities(args.target)
 
     config = TrainingConfig(
-        nstep=args.nstep,
-        nstep_per_grid=args.nstep_per_grid,
+        time_slices=args.time_slices,
+        solver_substeps=args.solver_substeps,
         lr=args.lr,
         epochs=args.epochs,
-        nsample=args.nsample,
-        nbatch=args.nbatch,
+        train_samples=args.train_samples,
+        train_batch_size=args.train_batch_size,
         seed=args.seed,
-        jump_kernel_std=args.jump_kernel_std,
         t_end=args.t_end,
     )
 

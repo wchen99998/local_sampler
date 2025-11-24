@@ -18,13 +18,12 @@ from locally_tilted_sampler import (
 prior = GaussianDensity.from_mean_cov([0.0, 0.0], [[1.5**2, 0.0], [0.0, 1.5**2]])
 target = make_gmm9(scale=3.0, std=0.35)
 config = TrainingConfig(
-    nstep=16,
-    nstep_per_grid=8,
+    time_slices=16,
+    solver_substeps=8,
     epochs=50,
-    nsample=1024,
-    nbatch=256,
+    train_samples=1024,
+    train_batch_size=256,
     seed=0,
-    jump_kernel_std=0.0,
 )
 result = train_locally_tilted_sampler(
     FlowDimensions(dim=2, hidden=128, depth=4),
