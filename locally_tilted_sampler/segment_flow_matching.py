@@ -25,14 +25,15 @@ class TrainingConfig:
     time_slices: int = 256
     solver_substeps: int = 32
     lr: float = 1e-3
-    weight_decay: float = 1e-6
-    epochs: int = 1000
+    weight_decay: float = 1e-4
+    max_updates: int = 1000
     train_samples: int = 20000
     train_batch_size: int = 1024
     threshold: float = 1e-5
     seed: int = 0
     t_end: float = 1.0
     dtmax: float | None = None
+    use_ancestral_pairs: bool = True
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,15 @@ def importance_sample_batch(
     weights = jax.nn.softmax(delta_t * log_prob_diff)
     indices = jax.random.choice(key, xbatch.shape[0], shape=(xbatch.shape[0],), p=weights)
     return xbatch[indices], indices
+
+
+def sample_random_pairs(
+    key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
+) -> Tuple[Array, Array]:
+    """Return (child, parent) pairs where parents are sampled uniformly (no ancestry)."""
+    x_is, _ = importance_sample_batch(key, xbatch, target, prior, delta_t)
+    parent_idx = jax.random.randint(key, (xbatch.shape[0],), 0, xbatch.shape[0])
+    return x_is, parent_idx
 
 
 def compute_weighted_loss(
@@ -86,20 +96,27 @@ def init_flow(flow_dims: FlowDimensions, key: jax.Array, lr: float, weight_decay
     return flow, optimizer
 
 
+@nnx.jit(static_argnums=3)
 def apply_single_flow(
     key: jax.Array,
     flow: FlowMLP,
     samples: Array,
     solver_substeps: int,
 ) -> Array:
-    samples = samples
+    del key  # unused but kept for API consistency
     ts = jnp.linspace(0.0, 1.0, solver_substeps, dtype=samples.dtype)
-    x = samples
-    for t_prev, t_next in zip(ts[:-1], ts[1:]):
-        t_val = jnp.full((x.shape[0], 1), t_prev, dtype=x.dtype)
+    t_prev = ts[:-1]
+    dt = ts[1:] - ts[:-1]
+
+    def body(x, inputs):
+        t_curr, dt_curr = inputs
+        t_val = jnp.full((x.shape[0], 1), t_curr, dtype=x.dtype)
         v = flow(x, t_val)
-        x = x + v * (t_next - t_prev)
-    return x
+        x_new = x + v * dt_curr
+        return x_new, None
+
+    x_final, _ = jax.lax.scan(body, samples, (t_prev, dt))
+    return x_final
 
 
 def propagate_flow_sequence(
@@ -154,13 +171,16 @@ def train_locally_tilted_sampler(
         print(f"[time slice start] t={t:.4f}, delta_t={delta_t:.4f}, samples={samples.shape[0]}")
 
         loss_val = jnp.inf
-        for step in range(config.epochs):
+        for step in range(config.max_updates):
             key, batch_key, is_key, loss_key = jax.random.split(key, 4)
             idx = jax.random.choice(
                 batch_key, config.train_samples, (config.train_batch_size,), replace=False
             )
             xbatch = samples[idx]
-            x_is, parents = importance_sample_batch(is_key, xbatch, target, prior, delta_t)
+            if config.use_ancestral_pairs:
+                x_is, parents = importance_sample_batch(is_key, xbatch, target, prior, delta_t)
+            else:
+                x_is, parents = sample_random_pairs(is_key, xbatch, target, prior, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
             if step % LOG_EVERY == 0:
@@ -174,7 +194,8 @@ def train_locally_tilted_sampler(
         time_points.append(t)
         print(f"[time slice end]  t={t:.4f}, loss={float(loss_val):.6f}")
 
-        key, prop_key = jax.random.split(key)
+        key, prop_key, samples_key = jax.random.split(key, 3)
+        samples = prior.sample(samples_key, (config.train_samples,))
         samples = propagate_flow_sequence(
             prop_key,
             flows,

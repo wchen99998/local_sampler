@@ -20,10 +20,11 @@ target = make_gmm9(scale=3.0, std=0.35)
 config = TrainingConfig(
     time_slices=16,
     solver_substeps=8,
-    epochs=50,
+    max_updates=50,
     train_samples=1024,
     train_batch_size=256,
     seed=0,
+    use_ancestral_pairs=True,  # set False to pair targets with random parents
 )
 result = train_locally_tilted_sampler(
     FlowDimensions(dim=2, hidden=128, depth=4),

@@ -32,7 +32,7 @@ def build_densities(target_name: str):
 def parse_args():
     p = argparse.ArgumentParser(description="Run Locally Tilted Sampler training (JAX/NNX).")
     p.add_argument("--target", choices=["gmm9", "gmm40"], default="gmm9")
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--max-updates", type=int, default=200, dest="max_updates")
     p.add_argument("--train-samples", type=int, default=1024, dest="train_samples")
     p.add_argument("--train-batch-size", type=int, default=256, dest="train_batch_size")
     p.add_argument("--time-slices", type=int, default=64, dest="time_slices")
@@ -42,6 +42,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--t-end", type=float, default=1.0, dest="t_end")
+    p.add_argument("--random-pairs", action="store_true", help="Use random parent pairing instead of ancestral.")
     p.add_argument("--plot-target", type=Path, default=None, dest="plot_path")
     return p.parse_args()
 
@@ -54,11 +55,12 @@ def main():
         time_slices=args.time_slices,
         solver_substeps=args.solver_substeps,
         lr=args.lr,
-        epochs=args.epochs,
+        max_updates=args.max_updates,
         train_samples=args.train_samples,
         train_batch_size=args.train_batch_size,
         seed=args.seed,
         t_end=args.t_end,
+        use_ancestral_pairs=not args.random_pairs,
     )
 
     result = train_locally_tilted_sampler(
