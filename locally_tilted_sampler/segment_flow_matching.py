@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Protocol, Sequence, Tuple
+from typing import Callable, List, Protocol, Sequence, Tuple
 
 import flax.nnx as nnx
 import jax
@@ -47,24 +47,31 @@ class TrainResult:
     final_samples: Array
 
 
-@nnx.jit(static_argnums=(2, 3, 4))
-def importance_sample_batch(
-    key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
-) -> Tuple[Array, Array]:
-    log_prob_diff = target.log_prob(xbatch) - prior.log_prob(xbatch)
-    weights = jax.nn.softmax(delta_t * log_prob_diff)
-    indices = jax.random.choice(key, xbatch.shape[0], shape=(xbatch.shape[0],), p=weights)
-    return xbatch[indices], indices
+def make_importance_sampler(
+    target_log_prob: Callable[[Array], Array],
+    prior_log_prob: Callable[[Array], Array],
+):
+    @nnx.jit(static_argnums=2)
+    def _fn(key: jax.Array, xbatch: Array, delta_t: float) -> Tuple[Array, Array]:
+        log_prob_diff = target_log_prob(xbatch) - prior_log_prob(xbatch)
+        weights = jax.nn.softmax(delta_t * log_prob_diff)
+        indices = jax.random.choice(key, xbatch.shape[0], shape=(xbatch.shape[0],), p=weights)
+        return xbatch[indices], indices
+
+    return _fn
 
 
-@nnx.jit(static_argnums=(2, 3, 4))
-def sample_random_pairs(
-    key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
-) -> Tuple[Array, Array]:
-    """Return (child, parent) pairs where parents are sampled uniformly (no ancestry)."""
-    x_is, _ = importance_sample_batch(key, xbatch, target, prior, delta_t)
-    parent_idx = jax.random.randint(key, (xbatch.shape[0],), 0, xbatch.shape[0])
-    return x_is, parent_idx
+def make_random_pair_sampler(
+    importance_sampler: Callable[[jax.Array, Array, float], Tuple[Array, Array]]
+):
+    @nnx.jit(static_argnums=2)
+    def _fn(key: jax.Array, xbatch: Array, delta_t: float) -> Tuple[Array, Array]:
+        """Return (child, parent) pairs where parents are sampled uniformly (no ancestry)."""
+        x_is, _ = importance_sampler(key, xbatch, delta_t)
+        parent_idx = jax.random.randint(key, (xbatch.shape[0],), 0, xbatch.shape[0])
+        return x_is, parent_idx
+
+    return _fn
 
 
 def compute_weighted_loss(
@@ -175,6 +182,10 @@ def train_locally_tilted_sampler(
     t = 0.0
     epsilon = 1e-6
 
+    # Build jitted samplers once.
+    importance_sampler = make_importance_sampler(target.log_prob, prior.log_prob)
+    random_pair_sampler = make_random_pair_sampler(importance_sampler)
+
     while t < config.t_end - epsilon:
         delta_t = float(min(dtmax, config.t_end - t))
         key, init_key = jax.random.split(key)
@@ -194,9 +205,9 @@ def train_locally_tilted_sampler(
             )
             xbatch = samples[idx]
             if config.use_ancestral_pairs:
-                x_is, parents = importance_sample_batch(is_key, xbatch, target, prior, delta_t)
+                x_is, parents = importance_sampler(is_key, xbatch, delta_t)
             else:
-                x_is, parents = sample_random_pairs(is_key, xbatch, target, prior, delta_t)
+                x_is, parents = random_pair_sampler(is_key, xbatch, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
             if step % config.log_every == 0 and config.loss_callback is None:
