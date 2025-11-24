@@ -12,7 +12,7 @@ from .flow import FlowDimensions, FlowMLP
 from .utils import LiveLossPlot, print_parameter_counts
 
 Array = jnp.ndarray
-LOG_EVERY = 50
+DEFAULT_LOG_EVERY = 50
 
 
 class Density(Protocol):
@@ -36,6 +36,7 @@ class TrainingConfig:
     use_ancestral_pairs: bool = True
     loss_callback: callable | None = None
     optimizer: str = "adamw"  # choices: adamw, adam, muon
+    log_every: int = DEFAULT_LOG_EVERY
 
 
 @dataclass(frozen=True)
@@ -196,9 +197,9 @@ def train_locally_tilted_sampler(
                 x_is, parents = sample_random_pairs(is_key, xbatch, target, prior, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
-            if step % LOG_EVERY == 0 and config.loss_callback is None:
+            if step % config.log_every == 0 and config.loss_callback is None:
                 print(f"  step {step:04d}  loss={float(loss_val):.6f}")
-            if config.loss_callback is not None and step % LOG_EVERY == 0:
+            if config.loss_callback is not None and step % config.log_every == 0:
                 config.loss_callback(
                     len(flows),  # time slice index
                     step,

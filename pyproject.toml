@@ -1,7 +1,7 @@
 [project]
 name = "locally-tilted-sampler"
 version = "0.1.0"
-description = "Add your description here"
+description = "Locally Tilted Sampler with Flax NNX (segment flow matching)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,3 +11,21 @@ dependencies = [
     "optax==0.2.6",
     "matplotlib>=3.8.0",
 ]
+keywords = ["flow-matching", "jax", "flax", "importance-sampling", "diffusion", "density-estimation"]
+license = {text = "MIT"}
+authors = [{name = "Locally Tilted Sampler authors"}]
+
+[project.urls]
+Homepage = "https://github.com/yourname/locally-tilted-sampler"
+Repository = "https://github.com/yourname/locally-tilted-sampler"
+Issues = "https://github.com/yourname/locally-tilted-sampler/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["locally_tilted_sampler"]
