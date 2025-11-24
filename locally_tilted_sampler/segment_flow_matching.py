@@ -47,6 +47,7 @@ class TrainResult:
     final_samples: Array
 
 
+@nnx.jit(static_argnums=(2, 3, 4))
 def importance_sample_batch(
     key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
 ) -> Tuple[Array, Array]:
@@ -56,6 +57,7 @@ def importance_sample_batch(
     return xbatch[indices], indices
 
 
+@nnx.jit(static_argnums=(2, 3, 4))
 def sample_random_pairs(
     key: jax.Array, xbatch: Array, target: Density, prior: Density, delta_t: float
 ) -> Tuple[Array, Array]:
