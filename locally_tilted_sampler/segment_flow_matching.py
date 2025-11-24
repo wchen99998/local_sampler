@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import optax
 
 from .flow import FlowDimensions, FlowMLP
-from .utils import print_parameter_counts
+from .utils import LiveLossPlot, print_parameter_counts
 
 Array = jnp.ndarray
 LOG_EVERY = 50
@@ -34,6 +34,8 @@ class TrainingConfig:
     t_end: float = 1.0
     dtmax: float | None = None
     use_ancestral_pairs: bool = True
+    loss_callback: callable | None = None
+    optimizer: str = "adamw"  # choices: adamw, adam, muon
 
 
 @dataclass(frozen=True)
@@ -89,9 +91,20 @@ def make_train_step():
     return train_step
 
 
-def init_flow(flow_dims: FlowDimensions, key: jax.Array, lr: float, weight_decay: float) -> Tuple[FlowMLP, nnx.Optimizer]:
+def _build_optimizer(name: str, lr: float, weight_decay: float):
+    name = name.lower()
+    if name == "adamw":
+        return optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+    if name == "adam":
+        return optax.adam(learning_rate=lr)
+    if name == "muon":
+       return optax.contrib.muon(learning_rate=lr, weight_decay=weight_decay)
+    raise ValueError(f"Unknown optimizer '{name}'. Expected one of ['adamw', 'adam', 'muon'].")
+
+
+def init_flow(flow_dims: FlowDimensions, key: jax.Array, lr: float, weight_decay: float, optimizer_name: str) -> Tuple[FlowMLP, nnx.Optimizer]:
     flow = FlowMLP(flow_dims, rngs=nnx.Rngs(key))
-    tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+    tx = _build_optimizer(optimizer_name, lr=lr, weight_decay=weight_decay)
     optimizer = nnx.Optimizer(flow, tx, wrt=nnx.Param)
     return flow, optimizer
 
@@ -162,7 +175,7 @@ def train_locally_tilted_sampler(
     while t < config.t_end - epsilon:
         delta_t = float(min(dtmax, config.t_end - t))
         key, init_key = jax.random.split(key)
-        flow, optimizer = init_flow(flow_dims, init_key, config.lr, config.weight_decay)
+        flow, optimizer = init_flow(flow_dims, init_key, config.lr, config.weight_decay, config.optimizer)
         train_step = make_train_step()
 
         if not printed_params:
@@ -183,8 +196,16 @@ def train_locally_tilted_sampler(
                 x_is, parents = sample_random_pairs(is_key, xbatch, target, prior, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
-            if step % LOG_EVERY == 0:
+            if step % LOG_EVERY == 0 and config.loss_callback is None:
                 print(f"  step {step:04d}  loss={float(loss_val):.6f}")
+            if config.loss_callback is not None and step % LOG_EVERY == 0:
+                config.loss_callback(
+                    len(flows),  # time slice index
+                    step,
+                    float(loss_val),
+                    float(t),
+                    float(delta_t),
+                )
             if float(loss_val) < config.threshold:
                 break
 
@@ -193,6 +214,14 @@ def train_locally_tilted_sampler(
         t += delta_t
         time_points.append(t)
         print(f"[time slice end]  t={t:.4f}, loss={float(loss_val):.6f}")
+        if config.loss_callback is not None:
+            config.loss_callback(
+                len(flows) - 1,
+                step,
+                float(loss_val),
+                float(t),
+                float(delta_t),
+            )
 
         key, prop_key, samples_key = jax.random.split(key, 3)
         samples = prior.sample(samples_key, (config.train_samples,))

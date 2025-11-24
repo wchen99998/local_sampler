@@ -7,10 +7,11 @@ import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 
+import math
+
 Array = jnp.ndarray
 
-
-LOG2PI = jnp.log(2.0 * jnp.pi)
+LOG2PI = math.log(2.0 * math.pi)
 
 
 def _as_array(x: Array | Sequence[float]) -> Array:
@@ -150,6 +151,8 @@ def plot_density(
     n_points: int = 200,
     contour_levels: int | None = None,
     to_prob: bool = True,
+    samples: Array | None = None,
+    sample_kwargs: dict | None = None,
 ):
     try:
         import matplotlib.pyplot as plt  # type: ignore
@@ -166,4 +169,10 @@ def plot_density(
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
     ax.set_title("Density")
+    if samples is not None:
+        kw = {"s": 4, "c": "r", "alpha": 0.6}
+        if sample_kwargs:
+            kw.update(sample_kwargs)
+        smp = jnp.asarray(samples)
+        ax.scatter(smp[:, 0], smp[:, 1], **kw)
     return fig, ax

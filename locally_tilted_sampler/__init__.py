@@ -6,7 +6,7 @@ from .densities import (
     make_gmm9,
     plot_density,
 )
-from .utils import print_parameter_counts
+from .utils import print_parameter_counts, LiveLossPlot
 from .flow import FlowDimensions, FlowMLP
 from .segment_flow_matching import (
     TrainingConfig,
@@ -31,4 +31,5 @@ __all__ = [
     "evaluate_on_grid",
     "plot_density",
     "print_parameter_counts",
+    "LiveLossPlot",
 ]

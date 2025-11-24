@@ -25,6 +25,7 @@ config = TrainingConfig(
     train_batch_size=256,
     seed=0,
     use_ancestral_pairs=True,  # set False to pair targets with random parents
+    optimizer="adamw",         # "adamw", "adam", or "muon" (if installed)
 )
 result = train_locally_tilted_sampler(
     FlowDimensions(dim=2, hidden=128, depth=4),
@@ -36,6 +37,11 @@ print("trained flows:", len(result.flows))
 print("final sample mean:", result.final_samples.mean(axis=0))
 fig, _ = plot_density(target.log_prob, bounds=(-5, 5), n_points=100)
 fig.savefig("target_density.png")
+
+# In notebooks, you can live-plot losses:
+# from locally_tilted_sampler import LiveLossPlot
+# live = LiveLossPlot()
+# config = config.replace(loss_callback=live.update)  # or rebuild TrainingConfig with loss_callback=live.update
 PY
 ```
 

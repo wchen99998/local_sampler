@@ -40,6 +40,7 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "muon"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--t-end", type=float, default=1.0, dest="t_end")
     p.add_argument("--random-pairs", action="store_true", help="Use random parent pairing instead of ancestral.")
@@ -61,6 +62,7 @@ def main():
         seed=args.seed,
         t_end=args.t_end,
         use_ancestral_pairs=not args.random_pairs,
+        optimizer=args.optimizer,
     )
 
     result = train_locally_tilted_sampler(

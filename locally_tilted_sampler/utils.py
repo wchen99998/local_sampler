@@ -4,6 +4,7 @@ import numpy as np
 
 import flax.nnx as nnx
 import jax
+from typing import Callable, Optional
 
 
 def print_parameter_counts(module: nnx.Module, module_name: str = "Model", max_depth: int = 3):
@@ -113,3 +114,73 @@ def print_parameter_counts(module: nnx.Module, module_name: str = "Model", max_d
             print(f"  - Smallest module: {format_number(min(param_counts))} params")
             print(f"  - Average module: {format_number(int(np.mean(param_counts)))} params")
             print()
+
+
+class LiveLossPlot:
+    """
+    Lightweight live loss plotting helper for notebooks.
+
+    Call ``update(time_slice, step, loss, t, delta_t)`` during training.
+    By default plots a separate figure per time slice to avoid mis-connected lines.
+    """
+
+    def __init__(self, title: str = "Training loss", per_slice: bool = True):
+        self.title = title
+        self.per_slice = per_slice
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            from IPython import display  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("LiveLossPlot requires matplotlib and IPython in notebooks") from exc
+        self.plt = plt
+        self.display = display
+        # time_slice -> dict with steps, losses, fig, ax, handle
+        self.series = {}
+        if not per_slice:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            handle = display.display(fig, display_id=True)
+            self.series["shared"] = {
+                "steps": [],
+                "losses": [],
+                "fig": fig,
+                "ax": ax,
+                "handle": handle,
+            }
+
+    def _get_series(self, time_slice: int):
+        if self.per_slice:
+            if time_slice not in self.series:
+                fig, ax = self.plt.subplots(figsize=(6, 4))
+                handle = self.display.display(fig, display_id=True)
+                self.series[time_slice] = {
+                    "steps": [],
+                    "losses": [],
+                    "fig": fig,
+                    "ax": ax,
+                    "handle": handle,
+                }
+            return self.series[time_slice]
+        return self.series["shared"]
+
+    def update(self, time_slice: int, step: int, loss: float, t: float, delta_t: float):
+        series = self._get_series(time_slice)
+        steps, losses, fig, ax, handle = (
+            series["steps"],
+            series["losses"],
+            series["fig"],
+            series["ax"],
+            series["handle"],
+        )
+        steps.append(step)
+        losses.append(loss)
+        ax.clear()
+        ax.plot(steps, losses, label=f"slice {time_slice}")
+        ax.set_xlabel("updates (within slice)" if self.per_slice else "updates")
+        ax.set_ylabel("loss")
+        ax.set_title(self.title if not self.per_slice else f"{self.title} (slice {time_slice})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        if handle is None:
+            series["handle"] = self.display.display(fig, display_id=True)
+        else:
+            handle.update(fig)
