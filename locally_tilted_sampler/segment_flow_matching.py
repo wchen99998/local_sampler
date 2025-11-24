@@ -12,6 +12,7 @@ from .flow import FlowDimensions, FlowMLP
 from .utils import print_parameter_counts
 
 Array = jnp.ndarray
+LOG_EVERY = 50
 
 
 class Density(Protocol):
@@ -150,9 +151,10 @@ def train_locally_tilted_sampler(
         if not printed_params:
             print_parameter_counts(flow, module_name="Flow", max_depth=3)
             printed_params = True
+        print(f"[time slice start] t={t:.4f}, delta_t={delta_t:.4f}, samples={samples.shape[0]}")
 
         loss_val = jnp.inf
-        for _ in range(config.epochs):
+        for step in range(config.epochs):
             key, batch_key, is_key, loss_key = jax.random.split(key, 4)
             idx = jax.random.choice(
                 batch_key, config.train_samples, (config.train_batch_size,), replace=False
@@ -161,6 +163,8 @@ def train_locally_tilted_sampler(
             x_is, parents = importance_sample_batch(is_key, xbatch, target, prior, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
+            if step % LOG_EVERY == 0:
+                print(f"  step {step:04d}  loss={float(loss_val):.6f}")
             if float(loss_val) < config.threshold:
                 break
 
@@ -168,6 +172,7 @@ def train_locally_tilted_sampler(
         loss_log.append(float(loss_val))
         t += delta_t
         time_points.append(t)
+        print(f"[time slice end]  t={t:.4f}, loss={float(loss_val):.6f}")
 
         key, prop_key = jax.random.split(key)
         samples = propagate_flow_sequence(
