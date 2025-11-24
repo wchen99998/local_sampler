@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Protocol, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, List, Mapping, Protocol, Sequence, Tuple
 
 import flax.nnx as nnx
 import jax
@@ -39,6 +39,7 @@ class TrainingConfig:
     random_walk_steps: int = 0
     loss_callback: callable | None = None
     optimizer: str = "adamw"  # choices: adamw, adam, muon
+    optimizer_kwargs: Mapping[str, float] = field(default_factory=dict)
     log_every: int = DEFAULT_LOG_EVERY
 
 
@@ -169,20 +170,21 @@ def make_train_step():
     return train_step
 
 
-def _build_optimizer(name: str, lr: float, weight_decay: float):
+def _build_optimizer(name: str, lr: float, weight_decay: float, **kwargs):
     name = name.lower()
+    wd = kwargs.pop("weight_decay", weight_decay)
     if name == "adamw":
-        return optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+        return optax.adamw(learning_rate=lr, weight_decay=wd, **kwargs)
     if name == "adam":
-        return optax.adam(learning_rate=lr)
+        return optax.adam(learning_rate=lr, **kwargs)
     if name == "muon":
-        return optax.contrib.muon(learning_rate=lr, weight_decay=weight_decay)
+        return optax.contrib.muon(learning_rate=lr, weight_decay=wd, **kwargs)
     raise ValueError(f"Unknown optimizer '{name}'. Expected one of ['adamw', 'adam', 'muon'].")
 
 
-def init_flow(flow_dims: FlowDimensions, key: jax.Array, lr: float, weight_decay: float, optimizer_name: str) -> Tuple[FlowMLP, nnx.Optimizer]:
+def init_flow(flow_dims: FlowDimensions, key: jax.Array, lr: float, weight_decay: float, optimizer_name: str, optimizer_kwargs: Mapping[str, float] | None = None) -> Tuple[FlowMLP, nnx.Optimizer]:
     flow = FlowMLP(flow_dims, rngs=nnx.Rngs(key))
-    tx = _build_optimizer(optimizer_name, lr=lr, weight_decay=weight_decay)
+    tx = _build_optimizer(optimizer_name, lr=lr, weight_decay=weight_decay, **(optimizer_kwargs or {}))
     optimizer = nnx.Optimizer(flow, tx, wrt=nnx.Param)
     return flow, optimizer
 
@@ -307,7 +309,14 @@ def train_locally_tilted_sampler(
     while t < config.t_end - epsilon:
         delta_t = float(min(dtmax, config.t_end - t))
         key, init_key = jax.random.split(key)
-        flow, optimizer = init_flow(flow_dims, init_key, config.lr, config.weight_decay, config.optimizer)
+        flow, optimizer = init_flow(
+            flow_dims,
+            init_key,
+            config.lr,
+            config.weight_decay,
+            config.optimizer,
+            config.optimizer_kwargs,
+        )
         train_step = make_train_step()
 
         if not printed_params:
