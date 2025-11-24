@@ -242,6 +242,11 @@ def train_locally_tilted_sampler(
     if not (0.0 < config.t_end <= 1.0):
         raise ValueError("t_end must be in (0, 1].")
 
+    steps_per_epoch = max(
+        1, (config.train_samples + config.train_batch_size - 1) // config.train_batch_size
+    )
+    total_batch_slots = steps_per_epoch * config.train_batch_size
+
     dtmax = 1.0 / config.time_slices if config.dtmax is None else config.dtmax
     key = jax.random.PRNGKey(config.seed)
 
@@ -255,6 +260,36 @@ def train_locally_tilted_sampler(
 
     t = 0.0
     epsilon = 1e-6
+
+    def build_epoch_batches(rng: jax.Array) -> Tuple[Array, jax.Array]:
+        perm_key, pad_key, next_key = jax.random.split(rng, 3)
+        perm = jax.random.permutation(perm_key, config.train_samples)
+        if total_batch_slots > config.train_samples:
+            pad = jax.random.choice(
+                pad_key,
+                config.train_samples,
+                shape=(total_batch_slots - config.train_samples,),
+                replace=False,
+            )
+            perm = jnp.concatenate([perm, pad], axis=0)
+        batches = perm.reshape((steps_per_epoch, config.train_batch_size))
+        return batches, next_key
+
+    def refresh_training_samples(
+        rng: jax.Array, current_flows: Sequence[FlowMLP]
+    ) -> Tuple[Array, jax.Array]:
+        sample_key, prop_key, next_key = jax.random.split(rng, 3)
+        new_samples = prior.sample(sample_key, (config.train_samples,))
+        new_samples = propagate_flow_sequence(
+            prop_key,
+            current_flows,
+            new_samples,
+            config.solver_substeps,
+            return_all=False,
+            random_walk_steps=config.random_walk_steps,
+            random_walk_std=config.random_walk_std,
+        )
+        return new_samples, next_key
 
     # Build jitted samplers once.
     importance_sampler = make_importance_sampler(target.log_prob, prior.log_prob)
@@ -274,17 +309,19 @@ def train_locally_tilted_sampler(
             printed_params = True
         print(f"[time slice start] t={t:.4f}, delta_t={delta_t:.4f}, samples={samples.shape[0]}")
 
+        epoch_batches, key = build_epoch_batches(key)
         loss_val = jnp.inf
         for step in range(config.max_updates):
+            epoch_step = step % steps_per_epoch
+            if step > 0 and epoch_step == 0:
+                samples, key = refresh_training_samples(key, flows)
+                epoch_batches, key = build_epoch_batches(key)
             if config.random_walk_steps > 0 and config.random_walk_std > 0.0:
-                key, batch_key, is_key, loss_key, rw_key = jax.random.split(key, 5)
+                key, is_key, loss_key, rw_key = jax.random.split(key, 4)
             else:
-                key, batch_key, is_key, loss_key = jax.random.split(key, 4)
+                key, is_key, loss_key = jax.random.split(key, 3)
                 rw_key = None
-            idx = jax.random.choice(
-                batch_key, config.train_samples, (config.train_batch_size,), replace=False
-            )
-            xbatch = samples[idx]
+            xbatch = samples[epoch_batches[epoch_step]]
             if rw_key is not None:
                 xbatch = apply_random_walk(
                     rw_key, xbatch, config.random_walk_steps, config.random_walk_std
@@ -322,17 +359,7 @@ def train_locally_tilted_sampler(
                 float(delta_t),
             )
 
-        key, prop_key, samples_key = jax.random.split(key, 3)
-        samples = prior.sample(samples_key, (config.train_samples,))
-        samples = propagate_flow_sequence(
-            prop_key,
-            flows,
-            samples,
-            config.solver_substeps,
-            return_all=False,
-            random_walk_steps=config.random_walk_steps,
-            random_walk_std=config.random_walk_std,
-        )
+        samples, key = refresh_training_samples(key, flows)
 
     return TrainResult(
         flows=flows,
