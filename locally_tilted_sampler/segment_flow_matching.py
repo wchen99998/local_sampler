@@ -292,6 +292,17 @@ def train_locally_tilted_sampler(
     epsilon = 1e-6
     viz_points = max(1, min(200, config.train_samples))
     fixed_bounds = config.viz_bounds
+    contour_data = None
+    if fixed_bounds is not None:
+        try:
+            xs = jnp.linspace(fixed_bounds[0], fixed_bounds[1], 180)
+            X, Y = jnp.meshgrid(xs, xs, indexing="xy")
+            grid = jnp.stack([X, Y], axis=-1).reshape((-1, 2))
+            lp = target.log_prob(grid)
+            lp = jnp.asarray(lp).reshape(X.shape)
+            contour_data = (np.asarray(X), np.asarray(Y), np.asarray(lp))
+        except Exception:
+            contour_data = None
 
     def build_epoch_batches(rng: jax.Array) -> Tuple[Array, jax.Array]:
         perm_key, pad_key, next_key = jax.random.split(rng, 3)
@@ -407,7 +418,9 @@ def train_locally_tilted_sampler(
         fig.savefig(out_dir / f"slice_{slice_idx:04d}_losses.png", bbox_inches="tight")
         plt.close(fig)
 
-    def save_trajectories(out_dir: Path, trajectories: Sequence[Tuple[str, Array]], tag: str):
+    def save_trajectories(
+        out_dir: Path, trajectories: Sequence[Tuple[str, Array]], tag: str, contour=None
+    ):
         if not trajectories:
             return
         np.savez(out_dir / f"trajectories_{tag}.npz", **{name: np.asarray(arr) for name, arr in trajectories})
@@ -437,6 +450,9 @@ def train_locally_tilted_sampler(
             if fixed_bounds is not None:
                 ax.set_xlim(*fixed_bounds)
                 ax.set_ylim(*fixed_bounds)
+            if contour is not None:
+                Xc, Yc, Zc = contour
+                ax.contour(Xc, Yc, Zc, levels=15, cmap="Greys", alpha=0.6)
         fig.tight_layout()
         fig.savefig(out_dir / f"trajectories_{tag}.png", bbox_inches="tight")
         plt.close(fig)
@@ -548,7 +564,7 @@ def train_locally_tilted_sampler(
                 trajectories,
             )
         if output_dir is not None and trajectories is not None:
-            save_trajectories(output_dir, trajectories, f"slice_{len(flows) - 1:04d}")
+            save_trajectories(output_dir, trajectories, f"slice_{len(flows) - 1:04d}", contour=contour_data)
             save_slice_loss(output_dir, slice_idx, slice_step_losses)
 
         samples, key = refresh_training_samples(key, flows)
@@ -559,9 +575,9 @@ def train_locally_tilted_sampler(
         save_array(output_dir, "final_samples", samples)
         save_loss_plot(output_dir, loss_log, time_points)
         final_traj, key = build_trajectory_chain(key, flows)
-        save_trajectories(output_dir, final_traj, "final_chain")
+        save_trajectories(output_dir, final_traj, "final_chain", contour=contour_data)
         if samples.ndim == 2 and samples.shape[1] >= 2:
-            save_trajectories(output_dir, [("final_samples", samples)], "final_samples")
+            save_trajectories(output_dir, [("final_samples", samples)], "final_samples", contour=contour_data)
 
     return TrainResult(
         flows=flows,

@@ -132,6 +132,10 @@ class LiveLossPlot:
         max_points: int = 200,
         traj_bounds: Tuple[float, float] | None = (-5.0, 5.0),
         save_dir: str | None = None,
+        contour_log_prob=None,
+        contour_bounds: Tuple[float, float] | None = None,
+        contour_levels: int = 15,
+        contour_points: int = 120,
     ):
         self.title = title
         self.per_slice = per_slice
@@ -144,6 +148,11 @@ class LiveLossPlot:
         self.save_dir = Path(save_dir).expanduser() if save_dir is not None else None
         if self.save_dir is not None:
             self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.contour_log_prob = contour_log_prob
+        self.contour_bounds = contour_bounds if contour_bounds is not None else traj_bounds
+        self.contour_levels = contour_levels
+        self.contour_points = contour_points
+        self._contour_cache = None
         try:
             import matplotlib.pyplot as plt  # type: ignore
             from IPython import display  # type: ignore
@@ -239,6 +248,10 @@ class LiveLossPlot:
                 ax.set_title(name)
                 continue
             pts = pts[: self.max_points]
+            self._ensure_contour()
+            if self._contour_cache is not None:
+                Xc, Yc, Zc = self._contour_cache
+                ax.contour(Xc, Yc, Zc, levels=self.contour_levels, cmap="Greys", alpha=0.5)
             ax.scatter(
                 pts[:, 0],
                 pts[:, 1],
@@ -306,3 +319,21 @@ class LiveLossPlot:
             handle.update(fig)
         if self.save_dir is not None:
             fig.savefig(self.save_dir / f"slice_{time_slice:04d}_step_{step:06d}.png", bbox_inches="tight")
+
+    def _ensure_contour(self):
+        if self._contour_cache is not None:
+            return
+        if self.contour_log_prob is None or self.contour_bounds is None:
+            return
+        lo, hi = self.contour_bounds
+        xs = np.linspace(lo, hi, self.contour_points)
+        X, Y = np.meshgrid(xs, xs)
+        pts = np.stack([X.ravel(), Y.ravel()], axis=-1)
+        try:
+            lp = self.contour_log_prob(pts)
+        except Exception:
+            lp = None
+        if lp is None:
+            return
+        lp = np.asarray(lp).reshape(X.shape)
+        self._contour_cache = (X, Y, lp)
