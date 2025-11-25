@@ -47,6 +47,7 @@ class TrainingConfig:
     optimizer_kwargs: Mapping[str, float] = field(default_factory=dict)
     log_every: int = DEFAULT_LOG_EVERY
     output_dir: str | None = None
+    viz_bounds: Tuple[float, float] | None = (-5.0, 5.0)
 
 
 @dataclass(frozen=True)
@@ -285,7 +286,7 @@ def train_locally_tilted_sampler(
     epsilon = 1e-6
     use_random_walk = config.random_walk_steps > 0 and config.random_walk_std > 0.0
     viz_points = max(1, min(200, config.train_samples))
-    fixed_bounds = (-5.0, 5.0)
+    fixed_bounds = config.viz_bounds
 
     def build_epoch_batches(rng: jax.Array) -> Tuple[Array, jax.Array]:
         perm_key, pad_key, next_key = jax.random.split(rng, 3)
@@ -416,8 +417,9 @@ def train_locally_tilted_sampler(
             ax.set_ylabel("x1")
             ax.set_aspect("equal", adjustable="box")
             ax.grid(True, alpha=0.3)
-            ax.set_xlim(*fixed_bounds)
-            ax.set_ylim(*fixed_bounds)
+            if fixed_bounds is not None:
+                ax.set_xlim(*fixed_bounds)
+                ax.set_ylim(*fixed_bounds)
         fig.tight_layout()
         fig.savefig(out_dir / f"trajectories_{tag}.png", bbox_inches="tight")
         plt.close(fig)
