@@ -290,7 +290,6 @@ def train_locally_tilted_sampler(
 
     t = 0.0
     epsilon = 1e-6
-    use_random_walk = config.random_walk_steps > 0 and config.random_walk_std > 0.0
     viz_points = max(1, min(200, config.train_samples))
     fixed_bounds = config.viz_bounds
 
