@@ -40,6 +40,7 @@ class TrainingConfig:
     use_stratified_coupling: bool = False
     random_walk_std: Union[float, Sequence[float]] = 0.0
     random_walk_steps: Union[int, Sequence[int]] = 0
+    random_walk_mode: str = "gaussian"  # "gaussian" or "hmc"
     loss_callback: Callable[
         [int, int, float, float, float, Sequence[Tuple[str, Array]] | None], None
     ] | None = None
@@ -99,6 +100,58 @@ def apply_random_walk(key: jax.Array, x: Array, steps: int, step_std: float) -> 
     scale = step_std * jnp.sqrt(float(steps))
     noise = jax.random.normal(key, x.shape) * scale
     return x + noise
+
+
+def make_hmc_transition(log_prob_fn: Callable[[Array], Array]):
+    def log_prob_single(x: Array) -> Array:
+        lp = log_prob_fn(x[None, ...])
+        return jnp.squeeze(lp, axis=0)
+
+    grad_log_prob = jax.grad(log_prob_single)
+
+    def _energy(x: Array, p: Array) -> Array:
+        return -log_prob_single(x) + 0.5 * jnp.sum(p * p)
+
+    def one_step(key: jax.Array, x0: Array, step_size: float, leapfrog_steps: int) -> Array:
+        if leapfrog_steps <= 0 or step_size <= 0.0:
+            return x0
+        key_mom, key_acc = jax.random.split(key)
+        p0 = jax.random.normal(key_mom, x0.shape)
+
+        def leapfrog(_, state):
+            x, p = state
+            p = p + 0.5 * step_size * grad_log_prob(x)
+            x = x + step_size * p
+            p = p + 0.5 * step_size * grad_log_prob(x)
+            return x, p
+
+        x_prop, p_prop = jax.lax.fori_loop(0, leapfrog_steps, leapfrog, (x0, p0))
+        h0 = _energy(x0, p0)
+        h_prop = _energy(x_prop, p_prop)
+        log_accept = -(h_prop - h0)
+        logu = jnp.log(jax.random.uniform(key_acc))
+        accept = logu < log_accept
+        return jnp.where(accept, x_prop, x0)
+
+    @nnx.jit  # keeps it fast; leapfrog_steps is traced per call
+    def hmc(key: jax.Array, x: Array, leapfrog_steps: int, step_size: float) -> Array:
+        n = x.shape[0]
+        keys = jax.random.split(key, n)
+        return jax.vmap(one_step, in_axes=(0, 0, None, None))(keys, x, step_size, leapfrog_steps)
+
+    return hmc
+
+
+def make_transition_fn(mode: str, log_prob_fn: Callable[[Array], Array] | None):
+    mode = mode.lower()
+    if mode not in {"gaussian", "hmc"}:
+        raise ValueError(f"random_walk_mode must be 'gaussian' or 'hmc', got '{mode}'.")
+    if mode == "gaussian":
+        return lambda key, x, steps, std: apply_random_walk(key, x, int(steps), float(std))
+    if log_prob_fn is None:
+        raise ValueError("HMC transition requires a log_prob_fn.")
+    hmc = make_hmc_transition(log_prob_fn)
+    return lambda key, x, steps, std: hmc(key, x, int(steps), float(std))
 
 
 def make_random_pair_sampler(
@@ -227,6 +280,7 @@ def propagate_flow_sequence(
     return_all: bool = False,
     random_walk_steps: Union[int, Sequence[int]] = 0,
     random_walk_std: Union[float, Sequence[float]] = 0.0,
+    transition_fn: Callable[[jax.Array, Array, int, float], Array] | None = None,
 ) -> Array | List[Array]:
     num_flows = len(flows)
 
@@ -248,7 +302,8 @@ def propagate_flow_sequence(
         std_curr = std_seq[idx]
         if steps_curr > 0 and std_curr > 0.0:
             key, rw_key = jax.random.split(key)
-            x = apply_random_walk(rw_key, x, steps_curr, std_curr)
+            fn = transition_fn or apply_random_walk
+            x = fn(rw_key, x, steps_curr, std_curr)
             if return_all:
                 history.append(x)
         key, subkey = jax.random.split(key)
@@ -271,6 +326,8 @@ def train_locally_tilted_sampler(
     output_dir = Path(config.output_dir).expanduser() if config.output_dir else None
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    transition_fn = make_transition_fn(config.random_walk_mode, target.log_prob)
 
     steps_per_epoch = max(
         1, (config.train_samples + config.train_batch_size - 1) // config.train_batch_size
@@ -331,6 +388,7 @@ def train_locally_tilted_sampler(
             return_all=False,
             random_walk_steps=rw_steps_schedule[: len(current_flows)],
             random_walk_std=rw_std_schedule[: len(current_flows)],
+            transition_fn=transition_fn,
         )
         return new_samples, next_key
 
@@ -348,7 +406,7 @@ def train_locally_tilted_sampler(
             rw_std_first = 0.0
         if rw_steps_first > 0 and rw_std_first > 0.0:
             rng, rw_key = jax.random.split(rng)
-            x = apply_random_walk(rw_key, x, rw_steps_first, rw_std_first)
+            x = transition_fn(rw_key, x, rw_steps_first, rw_std_first)
             stages.append(("rw_0", x))
         for idx, flow in enumerate(flows_for_viz):
             if idx < len(rw_steps_schedule):
@@ -359,7 +417,7 @@ def train_locally_tilted_sampler(
                 std_curr = 0.0
             if steps_curr > 0 and std_curr > 0.0:
                 rng, rw_key = jax.random.split(rng)
-                x = apply_random_walk(rw_key, x, steps_curr, std_curr)
+                x = transition_fn(rw_key, x, steps_curr, std_curr)
                 stages.append((f"rw_{idx}", x))
             rng, flow_key = jax.random.split(rng)
             x = apply_single_flow(flow_key, flow, x, config.solver_substeps)
@@ -516,9 +574,7 @@ def train_locally_tilted_sampler(
                 rw_key = None
             xbatch = samples[epoch_batches[epoch_step]]
             if rw_key is not None:
-                xbatch = apply_random_walk(
-                    rw_key, xbatch, rw_steps_curr, rw_std_curr
-                )
+                xbatch = transition_fn(rw_key, xbatch, rw_steps_curr, rw_std_curr)
             if config.use_ancestral_pairs:
                 x_is, parents = ancestral_pair_sampler(is_key, xbatch, delta_t)
             else:
