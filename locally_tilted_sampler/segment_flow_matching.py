@@ -133,7 +133,7 @@ def make_hmc_transition(log_prob_fn: Callable[[Array], Array]):
         accept = logu < log_accept
         return jnp.where(accept, x_prop, x0)
 
-    @nnx.jit  # keeps it fast; leapfrog_steps is traced per call
+    @nnx.jit(static_argnums=(2, 3))  # keep leapfrog_steps and step_size static for control flow
     def hmc(key: jax.Array, x: Array, leapfrog_steps: int, step_size: float) -> Array:
         n = x.shape[0]
         keys = jax.random.split(key, n)
