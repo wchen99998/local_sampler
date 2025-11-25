@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Callable, List, Mapping, Protocol, Sequence, Tuple
+from typing import Callable, List, Mapping, Protocol, Sequence, Tuple, Union
 
 import flax.nnx as nnx
 import jax
@@ -38,8 +38,8 @@ class TrainingConfig:
     dtmax: float | None = None
     use_ancestral_pairs: bool = True
     use_stratified_coupling: bool = False
-    random_walk_std: float = 0.0
-    random_walk_steps: int = 0
+    random_walk_std: Union[float, Sequence[float]] = 0.0
+    random_walk_steps: Union[int, Sequence[int]] = 0
     loss_callback: Callable[
         [int, int, float, float, float, Sequence[Tuple[str, Array]] | None], None
     ] | None = None
@@ -225,30 +225,36 @@ def propagate_flow_sequence(
     samples: Array,
     solver_substeps: int,
     return_all: bool = False,
-    random_walk_steps: int = 0,
-    random_walk_std: float = 0.0,
+    random_walk_steps: Union[int, Sequence[int]] = 0,
+    random_walk_std: Union[float, Sequence[float]] = 0.0,
 ) -> Array | List[Array]:
-    use_random_walk = random_walk_steps > 0 and random_walk_std > 0.0
+    num_flows = len(flows)
+
+    def _expand(val, n, name):
+        if isinstance(val, (list, tuple)):
+            if len(val) < n:
+                raise ValueError(f"{name} length {len(val)} is smaller than number of flows {n}.")
+            return list(val)
+        return [val] * n
+
+    steps_seq = _expand(random_walk_steps, num_flows, "random_walk_steps")
+    std_seq = _expand(random_walk_std, num_flows, "random_walk_std")
 
     x = samples
     history: List[Array] = [x] if return_all else []
 
-    if use_random_walk:
-        key, rw_key = jax.random.split(key)
-        x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
-        if return_all:
-            history.append(x)
-
     for idx, flow in enumerate(flows):
+        steps_curr = steps_seq[idx]
+        std_curr = std_seq[idx]
+        if steps_curr > 0 and std_curr > 0.0:
+            key, rw_key = jax.random.split(key)
+            x = apply_random_walk(rw_key, x, steps_curr, std_curr)
+            if return_all:
+                history.append(x)
         key, subkey = jax.random.split(key)
         x = apply_single_flow(subkey, flow, x, solver_substeps)
         if return_all:
             history.append(x)
-        if use_random_walk and idx < len(flows) - 1:
-            key, rw_key = jax.random.split(key)
-            x = apply_random_walk(rw_key, x, random_walk_steps, random_walk_std)
-            if return_all:
-                history.append(x)
 
     return history if return_all else x
 
@@ -313,8 +319,8 @@ def train_locally_tilted_sampler(
             new_samples,
             config.solver_substeps,
             return_all=False,
-            random_walk_steps=config.random_walk_steps,
-            random_walk_std=config.random_walk_std,
+            random_walk_steps=rw_steps_schedule[: len(current_flows)],
+            random_walk_std=rw_std_schedule[: len(current_flows)],
         )
         return new_samples, next_key
 
@@ -324,18 +330,30 @@ def train_locally_tilted_sampler(
         rng, sample_key = jax.random.split(rng)
         x = prior.sample(sample_key, (viz_points,))
         stages: List[Tuple[str, Array]] = [("prior", x)]
-        if use_random_walk:
+        if slice_idx < len(rw_steps_schedule):
+            rw_steps_first = rw_steps_schedule[slice_idx] if flows_for_viz else 0
+            rw_std_first = rw_std_schedule[slice_idx] if flows_for_viz else 0.0
+        else:
+            rw_steps_first = 0
+            rw_std_first = 0.0
+        if rw_steps_first > 0 and rw_std_first > 0.0:
             rng, rw_key = jax.random.split(rng)
-            x = apply_random_walk(rw_key, x, config.random_walk_steps, config.random_walk_std)
+            x = apply_random_walk(rw_key, x, rw_steps_first, rw_std_first)
             stages.append(("rw_0", x))
         for idx, flow in enumerate(flows_for_viz):
+            if idx < len(rw_steps_schedule):
+                steps_curr = rw_steps_schedule[idx]
+                std_curr = rw_std_schedule[idx]
+            else:
+                steps_curr = 0
+                std_curr = 0.0
+            if steps_curr > 0 and std_curr > 0.0:
+                rng, rw_key = jax.random.split(rng)
+                x = apply_random_walk(rw_key, x, steps_curr, std_curr)
+                stages.append((f"rw_{idx}", x))
             rng, flow_key = jax.random.split(rng)
             x = apply_single_flow(flow_key, flow, x, config.solver_substeps)
             stages.append((f"flow_{idx + 1}", x))
-            if use_random_walk and idx < len(flows_for_viz) - 1:
-                rng, rw_key = jax.random.split(rng)
-                x = apply_random_walk(rw_key, x, config.random_walk_steps, config.random_walk_std)
-                stages.append((f"rw_{idx + 1}", x))
         return stages, rng
 
     def save_experiment_config(out_dir: Path):
@@ -434,6 +452,18 @@ def train_locally_tilted_sampler(
     if output_dir is not None:
         save_experiment_config(output_dir)
 
+    def _expand_schedule(val: Union[int, float, Sequence], name: str) -> List:
+        if isinstance(val, (list, tuple)):
+            if len(val) < config.time_slices:
+                raise ValueError(
+                    f"{name} length {len(val)} is smaller than required time_slices={config.time_slices}."
+                )
+            return list(val)
+        return [val] * config.time_slices
+
+    rw_steps_schedule = _expand_schedule(config.random_walk_steps, "random_walk_steps")
+    rw_std_schedule = _expand_schedule(config.random_walk_std, "random_walk_std")
+
     while t < config.t_end - epsilon:
         slice_idx = len(flows)
         delta_t = float(min(dtmax, config.t_end - t))
@@ -456,12 +486,15 @@ def train_locally_tilted_sampler(
         epoch_batches, key = build_epoch_batches(key)
         loss_val = jnp.inf
         slice_step_losses: List[float] = []
+        rw_steps_curr = rw_steps_schedule[slice_idx]
+        rw_std_curr = rw_std_schedule[slice_idx]
+        use_random_walk_curr = rw_steps_curr > 0 and rw_std_curr > 0.0
         for step in range(config.max_updates):
             epoch_step = step % steps_per_epoch
             if step > 0 and epoch_step == 0:
                 samples, key = refresh_training_samples(key, flows)
                 epoch_batches, key = build_epoch_batches(key)
-            if use_random_walk:
+            if use_random_walk_curr:
                 key, is_key, loss_key, rw_key = jax.random.split(key, 4)
             else:
                 key, is_key, loss_key = jax.random.split(key, 3)
@@ -469,7 +502,7 @@ def train_locally_tilted_sampler(
             xbatch = samples[epoch_batches[epoch_step]]
             if rw_key is not None:
                 xbatch = apply_random_walk(
-                    rw_key, xbatch, config.random_walk_steps, config.random_walk_std
+                    rw_key, xbatch, rw_steps_curr, rw_std_curr
                 )
             if config.use_ancestral_pairs:
                 x_is, parents = ancestral_pair_sampler(is_key, xbatch, delta_t)
