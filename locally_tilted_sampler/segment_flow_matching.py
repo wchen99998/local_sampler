@@ -41,6 +41,7 @@ class TrainingConfig:
     random_walk_std: Union[float, Sequence[float]] = 0.0
     random_walk_steps: Union[int, Sequence[int]] = 0
     random_walk_mode: str = "gaussian"  # "gaussian" or "hmc"
+    random_walk_hmc_steps: Union[int, Sequence[int]] = 1
     loss_callback: Callable[
         [int, int, float, float, float, Sequence[Tuple[str, Array]] | None], None
     ] | None = None
@@ -133,25 +134,45 @@ def make_hmc_transition(log_prob_fn: Callable[[Array], Array]):
         accept = logu < log_accept
         return jnp.where(accept, x_prop, x0)
 
-    @nnx.jit(static_argnums=(2, 3))  # keep leapfrog_steps and step_size static for control flow
-    def hmc(key: jax.Array, x: Array, leapfrog_steps: int, step_size: float) -> Array:
+    @nnx.jit(static_argnums=(2, 3, 4))  # keep discrete params static
+    def hmc(
+        key: jax.Array,
+        x: Array,
+        n_steps: int,
+        leapfrog_steps: int,
+        step_size: float,
+    ) -> Array:
         n = x.shape[0]
-        keys = jax.random.split(key, n)
-        return jax.vmap(one_step, in_axes=(0, 0, None, None))(keys, x, step_size, leapfrog_steps)
+        keys = jax.random.split(key, n * n_steps).reshape(n, n_steps, 2)
+
+        def chain_one(x_init: Array, keys_row: Array) -> Array:
+            def body(x_curr, kpair):
+                kmain, = (kpair,)
+                return one_step(kmain, x_curr, step_size, leapfrog_steps), None
+
+            x_final, _ = jax.lax.scan(body, x_init, keys_row)
+            return x_final
+
+        return jax.vmap(chain_one, in_axes=(0, 0))(x, keys)
 
     return hmc
 
 
-def make_transition_fn(mode: str, log_prob_fn: Callable[[Array], Array] | None):
+def make_transition_fn(
+    mode: str,
+    log_prob_fn: Callable[[Array], Array] | None,
+):
     mode = mode.lower()
     if mode not in {"gaussian", "hmc"}:
         raise ValueError(f"random_walk_mode must be 'gaussian' or 'hmc', got '{mode}'.")
     if mode == "gaussian":
-        return lambda key, x, steps, std: apply_random_walk(key, x, int(steps), float(std))
+        return lambda key, x, steps, std, hmc=1: apply_random_walk(key, x, int(steps), float(std))
     if log_prob_fn is None:
         raise ValueError("HMC transition requires a log_prob_fn.")
     hmc = make_hmc_transition(log_prob_fn)
-    return lambda key, x, steps, std: hmc(key, x, int(steps), float(std))
+    return lambda key, x, steps, std, n_hmc=1: hmc(
+        key, x, n_steps=int(n_hmc), leapfrog_steps=int(steps), step_size=float(std)
+    )
 
 
 def make_random_pair_sampler(
@@ -280,7 +301,8 @@ def propagate_flow_sequence(
     return_all: bool = False,
     random_walk_steps: Union[int, Sequence[int]] = 0,
     random_walk_std: Union[float, Sequence[float]] = 0.0,
-    transition_fn: Callable[[jax.Array, Array, int, float], Array] | None = None,
+    random_walk_hmc_steps: Union[int, Sequence[int]] = 1,
+    transition_fn: Callable[[jax.Array, Array, int, float, int], Array] | None = None,
 ) -> Array | List[Array]:
     num_flows = len(flows)
 
@@ -293,6 +315,7 @@ def propagate_flow_sequence(
 
     steps_seq = _expand(random_walk_steps, num_flows, "random_walk_steps")
     std_seq = _expand(random_walk_std, num_flows, "random_walk_std")
+    hmc_seq = _expand(random_walk_hmc_steps, num_flows, "random_walk_hmc_steps")
 
     x = samples
     history: List[Array] = [x] if return_all else []
@@ -300,10 +323,11 @@ def propagate_flow_sequence(
     for idx, flow in enumerate(flows):
         steps_curr = steps_seq[idx]
         std_curr = std_seq[idx]
+        hmc_curr = hmc_seq[idx]
         if steps_curr > 0 and std_curr > 0.0:
             key, rw_key = jax.random.split(key)
-            fn = transition_fn or apply_random_walk
-            x = fn(rw_key, x, steps_curr, std_curr)
+            fn = transition_fn or (lambda k, arr, s, sd, nh: apply_random_walk(k, arr, s, sd))
+            x = fn(rw_key, x, steps_curr, std_curr, hmc_curr)
             if return_all:
                 history.append(x)
         key, subkey = jax.random.split(key)
@@ -388,6 +412,7 @@ def train_locally_tilted_sampler(
             return_all=False,
             random_walk_steps=rw_steps_schedule[: len(current_flows)],
             random_walk_std=rw_std_schedule[: len(current_flows)],
+            random_walk_hmc_steps=rw_hmc_steps_schedule[: len(current_flows)],
             transition_fn=transition_fn,
         )
         return new_samples, next_key
@@ -401,23 +426,27 @@ def train_locally_tilted_sampler(
         if slice_idx < len(rw_steps_schedule):
             rw_steps_first = rw_steps_schedule[slice_idx] if flows_for_viz else 0
             rw_std_first = rw_std_schedule[slice_idx] if flows_for_viz else 0.0
+            rw_hmc_first = rw_hmc_steps_schedule[slice_idx] if flows_for_viz else 1
         else:
             rw_steps_first = 0
             rw_std_first = 0.0
+            rw_hmc_first = 1
         if rw_steps_first > 0 and rw_std_first > 0.0:
             rng, rw_key = jax.random.split(rng)
-            x = transition_fn(rw_key, x, rw_steps_first, rw_std_first)
+            x = transition_fn(rw_key, x, rw_steps_first, rw_std_first, rw_hmc_first)
             stages.append(("rw_0", x))
         for idx, flow in enumerate(flows_for_viz):
             if idx < len(rw_steps_schedule):
                 steps_curr = rw_steps_schedule[idx]
                 std_curr = rw_std_schedule[idx]
+                hmc_curr = rw_hmc_steps_schedule[idx]
             else:
                 steps_curr = 0
                 std_curr = 0.0
+                hmc_curr = 1
             if steps_curr > 0 and std_curr > 0.0:
                 rng, rw_key = jax.random.split(rng)
-                x = transition_fn(rw_key, x, steps_curr, std_curr)
+                x = transition_fn(rw_key, x, steps_curr, std_curr, hmc_curr)
                 stages.append((f"rw_{idx}", x))
             rng, flow_key = jax.random.split(rng)
             x = apply_single_flow(flow_key, flow, x, config.solver_substeps)
@@ -536,6 +565,8 @@ def train_locally_tilted_sampler(
 
     rw_steps_schedule = _expand_schedule(config.random_walk_steps, "random_walk_steps")
     rw_std_schedule = _expand_schedule(config.random_walk_std, "random_walk_std")
+    rw_hmc_steps_schedule = _expand_schedule(config.random_walk_hmc_steps, "random_walk_hmc_steps")
+    rw_hmc_steps_schedule = _expand_schedule(config.random_walk_hmc_steps, "random_walk_hmc_steps")
 
     while t < config.t_end - epsilon:
         slice_idx = len(flows)
@@ -561,6 +592,7 @@ def train_locally_tilted_sampler(
         slice_step_losses: List[float] = []
         rw_steps_curr = rw_steps_schedule[slice_idx]
         rw_std_curr = rw_std_schedule[slice_idx]
+        rw_hmc_curr = rw_hmc_steps_schedule[slice_idx]
         use_random_walk_curr = rw_steps_curr > 0 and rw_std_curr > 0.0
         for step in range(config.max_updates):
             epoch_step = step % steps_per_epoch
@@ -574,7 +606,7 @@ def train_locally_tilted_sampler(
                 rw_key = None
             xbatch = samples[epoch_batches[epoch_step]]
             if rw_key is not None:
-                xbatch = transition_fn(rw_key, xbatch, rw_steps_curr, rw_std_curr)
+                xbatch = transition_fn(rw_key, xbatch, rw_steps_curr, rw_std_curr, rw_hmc_curr)
             if config.use_ancestral_pairs:
                 x_is, parents = ancestral_pair_sampler(is_key, xbatch, delta_t)
             else:
