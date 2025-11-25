@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, fields
+from pathlib import Path
 from typing import Callable, List, Mapping, Protocol, Sequence, Tuple
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from .flow import FlowDimensions, FlowMLP
@@ -43,6 +46,7 @@ class TrainingConfig:
     optimizer: str = "adamw"  # choices: adamw, adam, muon
     optimizer_kwargs: Mapping[str, float] = field(default_factory=dict)
     log_every: int = DEFAULT_LOG_EVERY
+    output_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +261,10 @@ def train_locally_tilted_sampler(
     if not (0.0 < config.t_end <= 1.0):
         raise ValueError("t_end must be in (0, 1].")
 
+    output_dir = Path(config.output_dir).expanduser() if config.output_dir else None
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     steps_per_epoch = max(
         1, (config.train_samples + config.train_batch_size - 1) // config.train_batch_size
     )
@@ -277,6 +285,7 @@ def train_locally_tilted_sampler(
     epsilon = 1e-6
     use_random_walk = config.random_walk_steps > 0 and config.random_walk_std > 0.0
     viz_points = max(1, min(200, config.train_samples))
+    fixed_bounds = (-5.0, 5.0)
 
     def build_epoch_batches(rng: jax.Array) -> Tuple[Array, jax.Array]:
         perm_key, pad_key, next_key = jax.random.split(rng, 3)
@@ -328,6 +337,91 @@ def train_locally_tilted_sampler(
                 stages.append((f"rw_{idx + 1}", x))
         return stages, rng
 
+    def save_experiment_config(out_dir: Path):
+        cfg = {}
+        for f in fields(config):
+            if f.name == "loss_callback":
+                cfg[f.name] = (
+                    None
+                    if config.loss_callback is None
+                    else getattr(config.loss_callback, "__name__", repr(config.loss_callback))
+                )
+            else:
+                cfg[f.name] = getattr(config, f.name)
+        cfg["output_dir"] = str(out_dir)
+        with (out_dir / "config.json").open("w") as f:
+            json.dump(cfg, f, indent=2)
+
+    def save_array(out_dir: Path, name: str, arr: Array):
+        np.save(out_dir / f"{name}.npy", np.asarray(arr))
+
+    def save_loss_plot(out_dir: Path, losses: Sequence[float], times: Sequence[float]):
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            return
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(times, losses, marker="o")
+        ax.set_xlabel("t")
+        ax.set_ylabel("loss (end of slice)")
+        ax.set_title("Slice losses")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / "loss_curve.png", bbox_inches="tight")
+        plt.close(fig)
+
+    def save_slice_loss(out_dir: Path, slice_idx: int, losses: Sequence[float]):
+        if not losses:
+            return
+        np.save(out_dir / f"slice_{slice_idx:04d}_losses.npy", np.asarray(losses))
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            return
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(np.arange(len(losses)), losses, label=f"slice {slice_idx}")
+        ax.set_xlabel("update")
+        ax.set_ylabel("loss")
+        ax.set_title(f"Training loss (slice {slice_idx})")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / f"slice_{slice_idx:04d}_losses.png", bbox_inches="tight")
+        plt.close(fig)
+
+    def save_trajectories(out_dir: Path, trajectories: Sequence[Tuple[str, Array]], tag: str):
+        if not trajectories:
+            return
+        np.savez(out_dir / f"trajectories_{tag}.npz", **{name: np.asarray(arr) for name, arr in trajectories})
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            return
+        cols = min(3, len(trajectories))
+        rows = (len(trajectories) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+        axes = np.atleast_1d(axes).reshape(rows, cols)
+        for ax in axes.flat[len(trajectories) :]:
+            ax.set_axis_off()
+        for ax, (name, arr) in zip(axes.flat, trajectories):
+            pts = np.asarray(arr)
+            if pts.ndim < 2 or pts.shape[1] < 2:
+                ax.set_axis_off()
+                ax.set_title(name)
+                continue
+            pts = pts[:viz_points]
+            ax.scatter(pts[:, 0], pts[:, 1], s=10, alpha=0.65, color="tab:blue", edgecolors="none")
+            ax.set_title(name)
+            ax.set_xlabel("x0")
+            ax.set_ylabel("x1")
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(*fixed_bounds)
+            ax.set_ylim(*fixed_bounds)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"trajectories_{tag}.png", bbox_inches="tight")
+        plt.close(fig)
+
     # Build jitted samplers once.
     importance_sampler = make_importance_sampler(target.log_prob, prior.log_prob)
     ancestral_pair_sampler = make_ancestral_pair_sampler(
@@ -335,7 +429,11 @@ def train_locally_tilted_sampler(
     )
     random_pair_sampler = make_random_pair_sampler(importance_sampler)
 
+    if output_dir is not None:
+        save_experiment_config(output_dir)
+
     while t < config.t_end - epsilon:
+        slice_idx = len(flows)
         delta_t = float(min(dtmax, config.t_end - t))
         key, init_key = jax.random.split(key)
         flow, optimizer = init_flow(
@@ -355,6 +453,7 @@ def train_locally_tilted_sampler(
 
         epoch_batches, key = build_epoch_batches(key)
         loss_val = jnp.inf
+        slice_step_losses: List[float] = []
         for step in range(config.max_updates):
             epoch_step = step % steps_per_epoch
             if step > 0 and epoch_step == 0:
@@ -376,6 +475,7 @@ def train_locally_tilted_sampler(
                 x_is, parents = random_pair_sampler(is_key, xbatch, delta_t)
             x_parents = xbatch[parents]
             flow, optimizer, loss_val = train_step(flow, optimizer, loss_key, x_parents, x_is)
+            slice_step_losses.append(float(loss_val))
 
             should_log = step % config.log_every == 0
             trajectories = None
@@ -401,8 +501,10 @@ def train_locally_tilted_sampler(
         t += delta_t
         time_points.append(t)
         print(f"[time slice end]  t={t:.4f}, loss={float(loss_val):.6f}")
-        if config.loss_callback is not None:
+        trajectories = None
+        if config.loss_callback is not None or output_dir is not None:
             trajectories, key = build_trajectory_chain(key, flows)
+        if config.loss_callback is not None:
             config.loss_callback(
                 len(flows) - 1,
                 step,
@@ -411,8 +513,21 @@ def train_locally_tilted_sampler(
                 float(delta_t),
                 trajectories,
             )
+        if output_dir is not None and trajectories is not None:
+            save_trajectories(output_dir, trajectories, f"slice_{len(flows) - 1:04d}")
+            save_slice_loss(output_dir, slice_idx, slice_step_losses)
 
         samples, key = refresh_training_samples(key, flows)
+
+    if output_dir is not None:
+        save_array(output_dir, "loss_log", np.array(loss_log))
+        save_array(output_dir, "time_points", np.array(time_points))
+        save_array(output_dir, "final_samples", samples)
+        save_loss_plot(output_dir, loss_log, time_points)
+        final_traj, key = build_trajectory_chain(key, flows)
+        save_trajectories(output_dir, final_traj, "final_chain")
+        if samples.ndim == 2 and samples.shape[1] >= 2:
+            save_trajectories(output_dir, [("final_samples", samples)], "final_samples")
 
     return TrainResult(
         flows=flows,

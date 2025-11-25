@@ -26,6 +26,7 @@ config = TrainingConfig(
     seed=0,
     use_ancestral_pairs=True,  # set False to pair targets with random parents
     optimizer="adamw",         # "adamw", "adam", or "muon" (if installed)
+    output_dir="runs/demo",    # saves config, losses, samples, and plots here
 )
 result = train_locally_tilted_sampler(
     FlowDimensions(dim=2, hidden=128, depth=4),
@@ -44,6 +45,8 @@ fig.savefig("target_density.png")
 # live = LiveLossPlot(title="Segment flow matching", traj_bounds=(-6, 6))
 # config = dc.replace(config, loss_callback=live.update)  # or rebuild TrainingConfig with loss_callback=live.update
 # The live plot shows loss plus per-stage 2D trajectory panels (prior, random walks, per-flow states; 200 pts each).
+# When output_dir is set, the trainer writes config.json, loss/time arrays, final samples,
+# per-slice trajectory npz/pngs, a loss curve, and final trajectory plots into that directory.
 PY
 ```
 

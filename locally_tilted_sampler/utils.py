@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Sequence, Tuple
+from pathlib import Path
 
 import flax.nnx as nnx
 import jax
@@ -130,6 +131,7 @@ class LiveLossPlot:
         per_slice: bool = True,
         max_points: int = 200,
         traj_bounds: Tuple[float, float] | None = (-5.0, 5.0),
+        save_dir: str | None = None,
     ):
         self.title = title
         self.per_slice = per_slice
@@ -139,6 +141,9 @@ class LiveLossPlot:
         ):
             raise ValueError("traj_bounds must be (min, max) with min < max or None.")
         self.traj_bounds = traj_bounds
+        self.save_dir = Path(save_dir).expanduser() if save_dir is not None else None
+        if self.save_dir is not None:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         try:
             import matplotlib.pyplot as plt  # type: ignore
             from IPython import display  # type: ignore
@@ -299,3 +304,5 @@ class LiveLossPlot:
             series["handle"] = self.display.display(fig, display_id=True)
         else:
             handle.update(fig)
+        if self.save_dir is not None:
+            fig.savefig(self.save_dir / f"slice_{time_slice:04d}_step_{step:06d}.png", bbox_inches="tight")
